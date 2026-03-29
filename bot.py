@@ -1199,6 +1199,24 @@ async def style_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@handler_guard
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = (update.message.text or "").strip()
+    command = raw.split()[0] if raw else "that command"
+    await update.message.reply_text(
+        f"I don't know how to handle `{command}` yet.\n\n"
+        "Try one of these commands:\n"
+        "- /start\n"
+        "- /help\n"
+        "- /tools\n"
+        "- /prefs\n"
+        "- /style\n"
+        "- /model\n"
+        "- /reset\n\n"
+        "Or tell me what you're trying to accomplish in plain language and I can guide you."
+    )
+
+
 def format_all_tools_text() -> str:
     return (
         "All tools:\n\n"
@@ -1241,6 +1259,8 @@ def main():
     app.add_handler(CommandHandler("model", model_command))
     app.add_handler(CommandHandler("reset", reset))
 
+    # Keep this after known CommandHandlers so it only catches unknown commands.
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
