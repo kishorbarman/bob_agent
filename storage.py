@@ -26,6 +26,7 @@ def init_storage() -> None:
                 timezone TEXT NOT NULL DEFAULT 'America/Los_Angeles',
                 language TEXT NOT NULL DEFAULT 'en',
                 response_style TEXT NOT NULL DEFAULT 'normal',
+                selected_model TEXT NOT NULL DEFAULT 'models/gemini-3.1-flash-lite-preview',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -66,6 +67,14 @@ def init_storage() -> None:
             );
             """
         )
+        # Lightweight schema migration for existing databases.
+        try:
+            conn.execute(
+                "ALTER TABLE user_preferences ADD COLUMN selected_model TEXT NOT NULL DEFAULT 'models/gemini-3.1-flash-lite-preview'"
+            )
+        except sqlite3.OperationalError:
+            # Column already exists.
+            pass
 
 
 def get_user_pref_row(user_id: int) -> dict[str, Any]:
@@ -79,8 +88,8 @@ def get_user_pref_row(user_id: int) -> dict[str, Any]:
         now = utc_now_iso()
         conn.execute(
             """
-            INSERT INTO user_preferences (user_id, timezone, language, response_style, created_at, updated_at)
-            VALUES (?, 'America/Los_Angeles', 'en', 'normal', ?, ?)
+            INSERT INTO user_preferences (user_id, timezone, language, response_style, selected_model, created_at, updated_at)
+            VALUES (?, 'America/Los_Angeles', 'en', 'normal', 'models/gemini-3.1-flash-lite-preview', ?, ?)
             """,
             (user_id, now, now),
         )
@@ -89,13 +98,14 @@ def get_user_pref_row(user_id: int) -> dict[str, Any]:
             "timezone": "America/Los_Angeles",
             "language": "en",
             "response_style": "normal",
+            "selected_model": "models/gemini-3.1-flash-lite-preview",
             "created_at": now,
             "updated_at": now,
         }
 
 
 def update_user_pref(user_id: int, key: str, value: str) -> None:
-    if key not in {"timezone", "language", "response_style"}:
+    if key not in {"timezone", "language", "response_style", "selected_model"}:
         raise ValueError(f"Unsupported preference key: {key}")
 
     now = utc_now_iso()

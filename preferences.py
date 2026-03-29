@@ -9,6 +9,7 @@ class UserPreferences:
     timezone: str = "America/Los_Angeles"
     language: str = "en"
     response_style: str = "normal"
+    selected_model: str = "models/gemini-3.1-flash-lite-preview"
 
 
 def get_user_preferences(user_id: int) -> UserPreferences:
@@ -18,6 +19,7 @@ def get_user_preferences(user_id: int) -> UserPreferences:
         timezone=row["timezone"],
         language=row["language"],
         response_style=row["response_style"],
+        selected_model=row["selected_model"],
     )
 
 
@@ -31,3 +33,7 @@ def set_language(user_id: int, language: str) -> None:
 
 def set_response_style(user_id: int, style: str) -> None:
     update_user_pref(user_id, "response_style", style)
+
+
+def set_selected_model(user_id: int, model: str) -> None:
+    update_user_pref(user_id, "selected_model", model)

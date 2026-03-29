@@ -29,6 +29,7 @@ from telegram.ext import (
 
 from google_services import (
     get_camera_status,
+    get_doorbell_snapshot,
     get_nest_devices,
     get_recent_emails,
     get_thermostat_status,
@@ -40,6 +41,7 @@ from google_services import (
 from preferences import (
     get_user_preferences,
     set_language,
+    set_selected_model,
     set_response_style,
     set_timezone,
 )
@@ -57,10 +59,13 @@ from storage import (
 )
 from telegram_ui import (
     artifact_actions_keyboard,
+    model_keyboard,
     parse_callback_data,
     prefs_keyboard,
     quick_actions_keyboard,
     render_card,
+    style_keyboard,
+    tools_category_keyboard,
     tools_keyboard,
     voice_preview_keyboard,
 )
@@ -69,10 +74,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-MODEL = "models/gemini-3.1-flash-lite-preview"
+DEFAULT_MODEL = "models/gemini-3.1-flash-lite-preview"
+MODEL_CHOICES = {
+    "models/gemini-3.1-flash-lite-preview": "Gemini 3.1 Flash-Lite Preview",
+    "models/gemini-3.1-pro-preview": "Gemini 3.1 Pro Preview",
+}
 
 # Per-user conversation history
 conversations: dict[int, list[dict]] = {}
+
+# Snapshot paths waiting to be sent; populated by the doorbell snapshot tool
+_snapshot_queue: dict[int, str] = {}
 
 SYSTEM_PROMPT = (
     "You are a helpful personal assistant called Bob. Be concise and direct. "
@@ -227,6 +239,7 @@ TOOLS = [
         },
     },
     {"name": "get_camera_status", "description": "Get Nest camera status.", "input_schema": {"type": "object", "properties": {}, "required": []}},
+    {"name": "get_doorbell_snapshot", "description": "Capture a live snapshot photo from the Nest doorbell camera.", "input_schema": {"type": "object", "properties": {}, "required": []}},
     {
         "name": "get_upcoming_events",
         "description": "Get upcoming Google Calendar events.",
@@ -476,7 +489,17 @@ def define_word(word: str) -> str:
     return "\n".join(lines)
 
 
-def run_tool(name: str, tool_input: dict) -> str:
+def _capture_doorbell_snapshot(user_id: int) -> str:
+    image_bytes, error = get_doorbell_snapshot()
+    if error:
+        return error
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+        f.write(image_bytes)
+        _snapshot_queue[user_id] = f.name
+    return "Doorbell snapshot captured."
+
+
+def run_tool(name: str, tool_input: dict, user_id: int = 0) -> str:
     if name == "get_current_time":
         return get_current_time(tool_input.get("timezone", ""))
     if name == "get_weather":
@@ -501,6 +524,8 @@ def run_tool(name: str, tool_input: dict) -> str:
         return set_thermostat_temperature(tool_input["temperature"], tool_input.get("unit", "celsius"))
     if name == "get_camera_status":
         return get_camera_status()
+    if name == "get_doorbell_snapshot":
+        return _capture_doorbell_snapshot(user_id)
     if name == "get_upcoming_events":
         return get_upcoming_events(tool_input.get("max_results", 10))
     if name == "search_calendar_events":
@@ -512,9 +537,9 @@ def run_tool(name: str, tool_input: dict) -> str:
     return "Unknown tool"
 
 
-def generate_short_model_response(instruction: str, text: str) -> str:
+def generate_short_model_response(instruction: str, text: str, model: str = DEFAULT_MODEL) -> str:
     response = gemini_generate_with_retry(
-        model=MODEL,
+        model=model,
         contents=[types.Content(role="user", parts=[types.Part(text=f"{instruction}\n\n{text}")])],
         config=types.GenerateContentConfig(
             system_instruction="You are Bob. Be concise and clear.",
@@ -526,6 +551,7 @@ def generate_short_model_response(instruction: str, text: str) -> str:
 
 def generate_agent_response(user_id: int, user_text: str, force_web: bool = False) -> str:
     prefs = get_user_preferences(user_id)
+    model = prefs.selected_model if prefs.selected_model in MODEL_CHOICES else DEFAULT_MODEL
     if user_id not in conversations:
         conversations[user_id] = []
 
@@ -549,7 +575,7 @@ def generate_agent_response(user_id: int, user_text: str, force_web: bool = Fals
     )
 
     while True:
-        response = gemini_generate_with_retry(MODEL, history, config)
+        response = gemini_generate_with_retry(model, history, config)
         candidate = response.candidates[0]
 
         function_call_parts = [p for p in candidate.content.parts if p.function_call]
@@ -557,14 +583,15 @@ def generate_agent_response(user_id: int, user_text: str, force_web: bool = Fals
         if not function_call_parts:
             reply = extract_text_from_parts(candidate.content.parts)
             conversations[user_id].append(candidate.content)
-            return style_reply(reply or "I could not generate a response.", prefs.response_style)
+            snapshot_path = _snapshot_queue.pop(user_id, None)
+            return style_reply(reply or "I could not generate a response.", prefs.response_style), snapshot_path
 
         history.append(candidate.content)
         function_response_parts = []
         for part in function_call_parts:
             fc = part.function_call
             try:
-                result = run_tool(fc.name, dict(fc.args))
+                result = run_tool(fc.name, dict(fc.args), user_id=user_id)
             except Exception as exc:
                 logger.exception("Tool execution failed: %s", fc.name)
                 result = f"Tool '{fc.name}' failed: {exc}"
@@ -583,11 +610,11 @@ def summarize_for_preview(text: str, max_len: int = 700) -> str:
     return text if len(text) <= max_len else text[:max_len] + "..."
 
 
-def analyze_image(path: Path) -> str:
+def analyze_image(path: Path, model: str = DEFAULT_MODEL) -> str:
     mime_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
     image_bytes = path.read_bytes()
     response = gemini_generate_with_retry(
-        model=MODEL,
+        model=model,
         contents=[
             types.Content(role="user", parts=[
                 types.Part(text="Extract visible text first, then summarize this image in concise bullets."),
@@ -599,11 +626,12 @@ def analyze_image(path: Path) -> str:
     return response.text or "I could not analyze that image."
 
 
-def summarize_document_text(text: str) -> str:
+def summarize_document_text(text: str, model: str = DEFAULT_MODEL) -> str:
     chunk = text[:12000]
     return generate_short_model_response(
         "Summarize this document into key points and include action items if any are implied.",
         chunk,
+        model=model,
     )
 
 
@@ -630,19 +658,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat_id = update.effective_chat.id
 
-    if context.user_data.get("awaiting_tool_query") == "weather":
-        context.user_data.pop("awaiting_tool_query", None)
+    pending_tool = context.user_data.get("awaiting_tool")
+    if pending_tool:
+        context.user_data.pop("awaiting_tool", None)
         async with processing_indicator(context.bot, chat_id):
-            weather = await asyncio.to_thread(fetch_weather, text)
-        out = render_card("weather", weather) if UX_PHASE2_ENABLED else weather
-        await send_reply_with_actions(update, text, out)
-        return
-
-    if context.user_data.get("awaiting_tool_query") == "news":
-        context.user_data.pop("awaiting_tool_query", None)
-        async with processing_indicator(context.bot, chat_id):
-            news = await asyncio.to_thread(get_news, text, 5)
-        out = render_card("news", news) if UX_PHASE2_ENABLED else news
+            if pending_tool == "tool_weather":
+                raw = await asyncio.to_thread(fetch_weather, text)
+                out = render_card("weather", raw) if UX_PHASE2_ENABLED else raw
+            elif pending_tool == "tool_news":
+                raw = await asyncio.to_thread(get_news, text, 5)
+                out = render_card("news", raw) if UX_PHASE2_ENABLED else raw
+            elif pending_tool == "tool_web_search":
+                out = await asyncio.to_thread(search_web, text, 5)
+            elif pending_tool == "tool_wikipedia":
+                out = await asyncio.to_thread(wikipedia_search, text)
+            elif pending_tool == "tool_calculate":
+                out = await asyncio.to_thread(calculate, text)
+            elif pending_tool == "tool_country":
+                out = await asyncio.to_thread(get_country_info, text)
+            elif pending_tool == "tool_define":
+                out = await asyncio.to_thread(define_word, text)
+            elif pending_tool == "tool_calendar_search":
+                raw = await asyncio.to_thread(search_calendar_events, text, 5)
+                out = render_card("calendar", raw) if UX_PHASE2_ENABLED else raw
+            elif pending_tool == "tool_email_search":
+                raw = await asyncio.to_thread(search_emails, text, 5)
+                out = render_card("email", raw) if UX_PHASE2_ENABLED else raw
+            else:
+                out = "Unsupported tool input."
         await send_reply_with_actions(update, text, out)
         return
 
@@ -671,8 +714,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     async with processing_indicator(context.bot, chat_id):
-        reply = await asyncio.to_thread(generate_agent_response, user_id, text)
-    await send_reply_with_actions(update, text, reply)
+        reply, snapshot_path = await asyncio.to_thread(generate_agent_response, user_id, text)
+    if snapshot_path:
+        await update.message.reply_photo(photo=open(snapshot_path, "rb"), caption=reply)
+        os.unlink(snapshot_path)
+    else:
+        await send_reply_with_actions(update, text, reply)
 
 
 @handler_guard
@@ -709,7 +756,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await tg_file.download_to_drive(custom_path=str(temp_path))
         async with processing_indicator(context.bot, update.effective_chat.id):
-            summary = await asyncio.to_thread(analyze_image, temp_path)
+            user_model = get_user_preferences(update.effective_user.id).selected_model
+            summary = await asyncio.to_thread(analyze_image, temp_path, user_model)
     finally:
         if temp_path.exists():
             temp_path.unlink()
@@ -742,19 +790,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await tg_file.download_to_drive(custom_path=str(temp_path))
 
         async with processing_indicator(context.bot, update.effective_chat.id):
+            user_model = get_user_preferences(update.effective_user.id).selected_model
             if doc_type == "image":
-                content = await asyncio.to_thread(analyze_image, temp_path)
+                content = await asyncio.to_thread(analyze_image, temp_path, user_model)
                 artifact_type = "image"
             elif doc_type == "pdf":
                 extracted = await asyncio.to_thread(extract_pdf_text, temp_path)
                 if not extracted.strip():
                     await update.message.reply_text("I could not extract text from that PDF.")
                     return
-                content = await asyncio.to_thread(summarize_document_text, extracted)
+                content = await asyncio.to_thread(summarize_document_text, extracted, user_model)
                 artifact_type = "document"
             else:
                 extracted = await asyncio.to_thread(temp_path.read_text, errors="ignore")
-                content = await asyncio.to_thread(summarize_document_text, extracted)
+                content = await asyncio.to_thread(summarize_document_text, extracted, user_model)
                 artifact_type = "document"
     finally:
         if temp_path.exists():
@@ -796,7 +845,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action.startswith("pref_style_"):
         style = action.replace("pref_style_", "")
         set_response_style(user_id, style)
-        await query.message.reply_text(f"Preference updated: response style = {style}")
+        await query.message.reply_text(
+            f"Preference updated: response style = {style}",
+            reply_markup=style_keyboard(style),
+        )
         return
 
     if action.startswith("pref_lang_"):
@@ -812,32 +864,124 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(f"Preference updated: timezone = {tz}")
         return
 
+    if action == "model_flash_lite":
+        set_selected_model(user_id, "models/gemini-3.1-flash-lite-preview")
+        prefs = get_user_preferences(user_id)
+        await query.message.reply_text(
+            f"Model updated: {MODEL_CHOICES[prefs.selected_model]}",
+            reply_markup=model_keyboard(prefs.selected_model),
+        )
+        return
+
+    if action == "model_pro":
+        set_selected_model(user_id, "models/gemini-3.1-pro-preview")
+        prefs = get_user_preferences(user_id)
+        await query.message.reply_text(
+            f"Model updated: {MODEL_CHOICES[prefs.selected_model]}",
+            reply_markup=model_keyboard(prefs.selected_model),
+        )
+        return
+
     if action == "tool_time":
         prefs = get_user_preferences(user_id)
         await query.message.reply_text(get_current_time(prefs.timezone))
         return
+    if action == "tools_home":
+        await query.message.reply_text("Choose a tool:", reply_markup=tools_keyboard())
+        return
+    if action == "tools_all":
+        await query.message.reply_text(format_all_tools_text())
+        return
+    if action.startswith("toolcat_"):
+        category = action.replace("toolcat_", "")
+        title_map = {
+            "research": "Research tools:",
+            "comms": "Calendar and email tools:",
+            "home": "Home tools:",
+            "utilities": "Utility tools:",
+            "media": "Media tools:",
+        }
+        await query.message.reply_text(
+            title_map.get(category, "Tools:"),
+            reply_markup=tools_category_keyboard(category),
+        )
+        return
     if action == "tool_weather":
-        context.user_data["awaiting_tool_query"] = "weather"
+        context.user_data["awaiting_tool"] = "tool_weather"
         await query.message.reply_text("Send a city name for weather.")
         return
     if action == "tool_news":
-        context.user_data["awaiting_tool_query"] = "news"
+        context.user_data["awaiting_tool"] = "tool_news"
         await query.message.reply_text("Send a topic for news.")
+        return
+    if action == "tool_web_search":
+        context.user_data["awaiting_tool"] = "tool_web_search"
+        await query.message.reply_text("Send your web search query.")
+        return
+    if action == "tool_wikipedia":
+        context.user_data["awaiting_tool"] = "tool_wikipedia"
+        await query.message.reply_text("Send a topic for Wikipedia.")
+        return
+    if action == "tool_calculate":
+        context.user_data["awaiting_tool"] = "tool_calculate"
+        await query.message.reply_text("Send a math expression, e.g. `sqrt(144)` or `2**10`.")
+        return
+    if action == "tool_country":
+        context.user_data["awaiting_tool"] = "tool_country"
+        await query.message.reply_text("Send a country name.")
+        return
+    if action == "tool_define":
+        context.user_data["awaiting_tool"] = "tool_define"
+        await query.message.reply_text("Send a word to define.")
         return
     if action == "tool_calendar":
         async with processing_indicator(context.bot, query.message.chat_id):
             text = await asyncio.to_thread(get_upcoming_events, 8)
         await query.message.reply_text(render_card("calendar", text) if UX_PHASE2_ENABLED else text)
         return
+    if action == "tool_calendar_search":
+        context.user_data["awaiting_tool"] = "tool_calendar_search"
+        await query.message.reply_text("Send a calendar search term.")
+        return
     if action == "tool_email":
         async with processing_indicator(context.bot, query.message.chat_id):
             text = await asyncio.to_thread(get_recent_emails, 5)
         await query.message.reply_text(render_card("email", text) if UX_PHASE2_ENABLED else text)
         return
+    if action == "tool_email_search":
+        context.user_data["awaiting_tool"] = "tool_email_search"
+        await query.message.reply_text("Send a Gmail search query (e.g. `from:alice invoice`).")
+        return
+    if action == "tool_nest_devices":
+        async with processing_indicator(context.bot, query.message.chat_id):
+            text = await asyncio.to_thread(get_nest_devices)
+        await query.message.reply_text(text)
+        return
     if action == "tool_nest":
         async with processing_indicator(context.bot, query.message.chat_id):
             text = await asyncio.to_thread(get_thermostat_status)
         await query.message.reply_text(text)
+        return
+    if action == "tool_camera_status":
+        async with processing_indicator(context.bot, query.message.chat_id):
+            text = await asyncio.to_thread(get_camera_status)
+        await query.message.reply_text(text)
+        return
+    if action == "tool_doorbell_snapshot":
+        async with processing_indicator(context.bot, query.message.chat_id):
+            text = await asyncio.to_thread(run_tool, "get_doorbell_snapshot", {}, user_id)
+        snapshot_path = _snapshot_queue.pop(user_id, None)
+        if snapshot_path:
+            await query.message.reply_photo(photo=open(snapshot_path, "rb"), caption=text)
+            os.unlink(snapshot_path)
+        else:
+            await query.message.reply_text(text)
+        return
+    if action == "tool_media_help":
+        await query.message.reply_text(
+            "Send a photo, image file, PDF, or text file and I will analyze it. "
+            "Then use follow-up buttons for summarize/action-items/Q&A."
+        )
         return
 
     if action in {"voice_use", "voice_edit", "voice_cancel"}:
@@ -855,7 +999,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("No pending transcription found.")
             return
         async with processing_indicator(context.bot, query.message.chat_id):
-            reply = await asyncio.to_thread(generate_agent_response, user_id, text)
+            reply, snapshot_path = await asyncio.to_thread(generate_agent_response, user_id, text)
+        if snapshot_path:
+            await query.message.reply_photo(photo=open(snapshot_path, "rb"), caption=reply)
+            os.unlink(snapshot_path)
+            return
         sent = await query.message.reply_text(reply)
         save_message_context(user_id, sent.message_id, text, reply)
         if UX_PHASE1_ENABLED:
@@ -873,23 +1021,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if action == "artifact_summarize":
             async with processing_indicator(context.bot, query.message.chat_id):
+                model = get_user_preferences(user_id).selected_model
                 out = await asyncio.to_thread(
                     generate_short_model_response,
                     "Summarize this artifact in 5 concise bullets.",
                     artifact["content_text"],
+                    model,
                 )
             await query.message.reply_text(out)
             return
         async with processing_indicator(context.bot, query.message.chat_id):
+            model = get_user_preferences(user_id).selected_model
             out = await asyncio.to_thread(
                 generate_short_model_response,
                 "Extract actionable next steps from this artifact.",
                 artifact["content_text"],
+                model,
             )
         await query.message.reply_text(out)
         return
 
-    if action in {"simplify", "summarize", "translate", "retry", "search_web"}:
+    if action in {"elaborate", "summarize", "translate", "retry", "search_web"}:
         ctx = get_message_context(user_id, message_id)
         if not ctx:
             await query.message.reply_text("I could not find context for this action. Please ask again.")
@@ -898,19 +1050,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         source_text = ctx["reply_text"]
         original_prompt = ctx["original_prompt"]
 
-        if action == "simplify":
+        if action == "elaborate":
             async with processing_indicator(context.bot, query.message.chat_id):
+                model = get_user_preferences(user_id).selected_model
                 out = await asyncio.to_thread(
                     generate_short_model_response,
-                    "Rewrite this answer in simpler language.",
+                    "Elaborate on this answer with more depth, context, and detail while staying clear.",
                     source_text,
+                    model,
                 )
         elif action == "summarize":
             async with processing_indicator(context.bot, query.message.chat_id):
+                model = get_user_preferences(user_id).selected_model
                 out = await asyncio.to_thread(
                     generate_short_model_response,
                     "Summarize this in 3 to 5 bullets.",
                     source_text,
+                    model,
                 )
         elif action == "translate":
             prefs = get_user_preferences(user_id)
@@ -919,10 +1075,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     generate_short_model_response,
                     f"Translate this to {prefs.language}. Keep formatting compact.",
                     source_text,
+                    prefs.selected_model,
                 )
         elif action == "retry":
             async with processing_indicator(context.bot, query.message.chat_id):
-                out = await asyncio.to_thread(generate_agent_response, user_id, original_prompt, True)
+                out, snapshot_path = await asyncio.to_thread(generate_agent_response, user_id, original_prompt, True)
+            if snapshot_path:
+                await query.message.reply_photo(photo=open(snapshot_path, "rb"), caption=out)
+                os.unlink(snapshot_path)
+                return
         else:
             async with processing_indicator(context.bot, query.message.chat_id):
                 web_results = await asyncio.to_thread(search_web, original_prompt, 5)
@@ -939,10 +1100,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             else:
                 async with processing_indicator(context.bot, query.message.chat_id):
+                    model = get_user_preferences(user_id).selected_model
                     out = await asyncio.to_thread(
                         generate_short_model_response,
                         "Create a concise answer from these web snippets and include source URLs.",
                         web_results,
+                        model,
                     )
 
         sent = await query.message.reply_text(out)
@@ -980,7 +1143,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- Weather, web search, news, Wikipedia, calculator\n"
         "- Google Calendar + Gmail\n"
         "- Nest status and control\n"
-        "- Voice notes and file/image understanding\n\n"
+        "- Voice notes and file/image understanding\n"
+        "- /model to switch Gemini model\n\n"
+        "- /style to quickly change response style\n\n"
         "Try:\n"
         "- 'Summarize my upcoming events'\n"
         "- 'Search latest AI model news'\n"
@@ -990,6 +1155,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @handler_guard
 async def tools_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args and context.args[0].lower() == "all":
+        await update.message.reply_text(
+            format_all_tools_text()
+        )
+        return
     await update.message.reply_text("Choose a tool:", reply_markup=tools_keyboard())
 
 
@@ -998,8 +1168,62 @@ async def prefs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prefs = get_user_preferences(update.effective_user.id)
     await update.message.reply_text(
         f"Current prefs:\n- style: {prefs.response_style}\n- language: {prefs.language}\n- timezone: {prefs.timezone}\n\n"
-        "Tap to update:",
-        reply_markup=prefs_keyboard(),
+        "Use /style for clearer style options. Quick update:",
+        reply_markup=style_keyboard(prefs.response_style),
+    )
+
+
+@handler_guard
+async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    prefs = get_user_preferences(update.effective_user.id)
+    model_name = MODEL_CHOICES.get(prefs.selected_model, prefs.selected_model)
+    await update.message.reply_text(
+        "Choose the model for your responses:\n"
+        "- Gemini 3.1 Flash-Lite Preview: faster/lower cost\n"
+        "- Gemini 3.1 Pro Preview: stronger reasoning\n\n"
+        f"Current: {model_name}",
+        reply_markup=model_keyboard(prefs.selected_model),
+    )
+
+
+@handler_guard
+async def style_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    prefs = get_user_preferences(update.effective_user.id)
+    await update.message.reply_text(
+        "Choose response style:\n"
+        "- Short: concise, high-signal output\n"
+        "- Normal: balanced detail\n"
+        "- Detailed: more depth and context\n\n"
+        f"Current: {prefs.response_style}",
+        reply_markup=style_keyboard(prefs.response_style),
+    )
+
+
+def format_all_tools_text() -> str:
+    return (
+        "All tools:\n\n"
+        "Research\n"
+        "- Web Search\n"
+        "- News\n"
+        "- Wikipedia\n"
+        "- Country Info\n"
+        "- Dictionary\n\n"
+        "Comms\n"
+        "- Upcoming Events\n"
+        "- Search Calendar\n"
+        "- Recent Emails\n"
+        "- Search Emails\n\n"
+        "Home\n"
+        "- Nest Devices\n"
+        "- Thermostat Status\n"
+        "- Camera Status\n"
+        "- Doorbell Snapshot\n\n"
+        "Utilities\n"
+        "- Time\n"
+        "- Weather\n"
+        "- Calculator\n\n"
+        "Media\n"
+        "- Send an image, PDF, or text file for analysis"
     )
 
 
@@ -1013,6 +1237,8 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("tools", tools_command))
     app.add_handler(CommandHandler("prefs", prefs_command))
+    app.add_handler(CommandHandler("style", style_command))
+    app.add_handler(CommandHandler("model", model_command))
     app.add_handler(CommandHandler("reset", reset))
 
     app.add_handler(CallbackQueryHandler(handle_callback))

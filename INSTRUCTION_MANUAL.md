@@ -103,13 +103,15 @@ python3 bot.py
 - `/help`: Shows capability guide and example prompts
 - `/tools`: Opens one-tap tool launcher
 - `/prefs`: Opens style/language/timezone preferences menu
+- `/style`: Opens readable style-only selector (`short`, `normal`, `detailed`)
+- `/model`: Select model (`Gemini 3.1 Flash-Lite Preview` or `Gemini 3.1 Pro Preview`)
 - `/reset`: Clears in-memory conversation for current user
 
 ### Quick Actions on assistant replies
 
 Each assistant response can include action buttons:
 - `Search Web`: Pulls web snippets and synthesizes a current answer
-- `Simplify`: Rewrites previous answer in simpler language
+- `Elaborate`: Expands previous answer with more depth and context
 - `Summarize`: Compresses previous answer into short bullets
 - `Translate`: Translates previous answer to user preference language
 - `Retry`: Re-runs answer generation with stronger web intent

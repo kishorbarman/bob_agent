@@ -23,7 +23,7 @@ def quick_actions_keyboard(ctx: str) -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton("Search Web", callback_data=make_callback("search_web", ctx)),
-                InlineKeyboardButton("Simplify", callback_data=make_callback("simplify", ctx)),
+                InlineKeyboardButton("Elaborate", callback_data=make_callback("elaborate", ctx)),
                 InlineKeyboardButton("Summarize", callback_data=make_callback("summarize", ctx)),
             ],
             [
@@ -41,15 +41,62 @@ def tools_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton("Time", callback_data=make_callback("tool_time")),
                 InlineKeyboardButton("Weather", callback_data=make_callback("tool_weather")),
-                InlineKeyboardButton("News", callback_data=make_callback("tool_news")),
+                InlineKeyboardButton("Calendar", callback_data=make_callback("tool_calendar")),
             ],
             [
-                InlineKeyboardButton("Calendar", callback_data=make_callback("tool_calendar")),
-                InlineKeyboardButton("Email", callback_data=make_callback("tool_email")),
-                InlineKeyboardButton("Nest", callback_data=make_callback("tool_nest")),
+                InlineKeyboardButton("Research", callback_data=make_callback("toolcat_research")),
+                InlineKeyboardButton("Comms", callback_data=make_callback("toolcat_comms")),
+            ],
+            [
+                InlineKeyboardButton("Home", callback_data=make_callback("toolcat_home")),
+                InlineKeyboardButton("Utilities", callback_data=make_callback("toolcat_utilities")),
+            ],
+            [
+                InlineKeyboardButton("Media", callback_data=make_callback("toolcat_media")),
+                InlineKeyboardButton("All Tools", callback_data=make_callback("tools_all")),
             ],
         ]
     )
+
+
+def tools_category_keyboard(category: str) -> InlineKeyboardMarkup:
+    if category == "research":
+        rows = [
+            [InlineKeyboardButton("Web Search", callback_data=make_callback("tool_web_search"))],
+            [InlineKeyboardButton("News", callback_data=make_callback("tool_news"))],
+            [InlineKeyboardButton("Wikipedia", callback_data=make_callback("tool_wikipedia"))],
+            [InlineKeyboardButton("Country Info", callback_data=make_callback("tool_country"))],
+            [InlineKeyboardButton("Dictionary", callback_data=make_callback("tool_define"))],
+        ]
+    elif category == "comms":
+        rows = [
+            [InlineKeyboardButton("Upcoming Events", callback_data=make_callback("tool_calendar"))],
+            [InlineKeyboardButton("Search Calendar", callback_data=make_callback("tool_calendar_search"))],
+            [InlineKeyboardButton("Recent Emails", callback_data=make_callback("tool_email"))],
+            [InlineKeyboardButton("Search Emails", callback_data=make_callback("tool_email_search"))],
+        ]
+    elif category == "home":
+        rows = [
+            [InlineKeyboardButton("Nest Devices", callback_data=make_callback("tool_nest_devices"))],
+            [InlineKeyboardButton("Thermostat Status", callback_data=make_callback("tool_nest"))],
+            [InlineKeyboardButton("Camera Status", callback_data=make_callback("tool_camera_status"))],
+            [InlineKeyboardButton("Doorbell Snapshot", callback_data=make_callback("tool_doorbell_snapshot"))],
+        ]
+    elif category == "utilities":
+        rows = [
+            [InlineKeyboardButton("Time", callback_data=make_callback("tool_time"))],
+            [InlineKeyboardButton("Weather", callback_data=make_callback("tool_weather"))],
+            [InlineKeyboardButton("Calculator", callback_data=make_callback("tool_calculate"))],
+        ]
+    elif category == "media":
+        rows = [
+            [InlineKeyboardButton("How Media Works", callback_data=make_callback("tool_media_help"))],
+        ]
+    else:
+        rows = []
+
+    rows.append([InlineKeyboardButton("Back", callback_data=make_callback("tools_home"))])
+    return InlineKeyboardMarkup(rows)
 
 
 def prefs_keyboard() -> InlineKeyboardMarkup:
@@ -74,6 +121,19 @@ def prefs_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def style_keyboard(current_style: str) -> InlineKeyboardMarkup:
+    short_label = "Short (current)" if current_style == "short" else "Short"
+    normal_label = "Normal (current)" if current_style == "normal" else "Normal"
+    detailed_label = "Detailed (current)" if current_style == "detailed" else "Detailed"
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(short_label, callback_data=make_callback("pref_style_short"))],
+            [InlineKeyboardButton(normal_label, callback_data=make_callback("pref_style_normal"))],
+            [InlineKeyboardButton(detailed_label, callback_data=make_callback("pref_style_detailed"))],
+        ]
+    )
+
+
 def voice_preview_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[
@@ -92,6 +152,21 @@ def artifact_actions_keyboard() -> InlineKeyboardMarkup:
         ], [
             InlineKeyboardButton("Ask question", callback_data=make_callback("artifact_ask")),
         ]]
+    )
+
+
+def model_keyboard(current_model: str) -> InlineKeyboardMarkup:
+    flash = "Flash-Lite"
+    pro = "Pro"
+    if current_model == "models/gemini-3.1-flash-lite-preview":
+        flash = "Flash-Lite ✓"
+    if current_model == "models/gemini-3.1-pro-preview":
+        pro = "Pro ✓"
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(flash, callback_data=make_callback("model_flash_lite"))],
+            [InlineKeyboardButton(pro, callback_data=make_callback("model_pro"))],
+        ]
     )
 
 

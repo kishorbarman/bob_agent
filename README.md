@@ -9,7 +9,7 @@ For complete operational instructions, see [`INSTRUCTION_MANUAL.md`](INSTRUCTION
 | Tool | What Bob can do |
 |------|----------------|
 | 💬 Chat | General Q&A, reasoning, writing — powered by Gemini |
-| 🎛 UX actions | Inline quick actions: search web, simplify, summarize, translate, retry |
+| 🎛 UX actions | Inline quick actions: search web, elaborate, summarize, translate, retry |
 | 🧭 Command menu | `/help`, `/tools`, `/prefs` guided flows |
 | 🕐 Time | Current date and time in any timezone |
 | 🌤 Weather | Current conditions + 3-day forecast for any city |
@@ -90,6 +90,8 @@ tmux attach -t bob           # reattach later
 | `/help` | Show capabilities and example prompts |
 | `/tools` | Open one-tap tool launcher |
 | `/prefs` | Update response style, language, and timezone |
+| `/style` | Set response style with readable options |
+| `/model` | Choose model: Gemini 3.1 Flash-Lite Preview or Gemini 3.1 Pro Preview |
 | `/reset` | Clear conversation history |
 
 ## Project Structure
