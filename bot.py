@@ -317,6 +317,7 @@ UX_PHASE2_ENABLED = env_flag("UX_PHASE2_ENABLED", True)
 UX_PHASE3_ENABLED = env_flag("UX_PHASE3_ENABLED", True)
 UX_PHASE4_ENABLED = env_flag("UX_PHASE4_ENABLED", True)
 OFFLINE_BROADCAST_ENABLED = env_flag("OFFLINE_BROADCAST_ENABLED", True)
+ONLINE_BROADCAST_ENABLED = env_flag("ONLINE_BROADCAST_ENABLED", True)
 
 
 def handler_guard(func):
@@ -1313,11 +1314,34 @@ async def on_post_stop(app):
             logger.debug("Failed to send offline notice", extra={"user_id": user_id}, exc_info=True)
 
 
+async def on_post_init(app):
+    if not ONLINE_BROADCAST_ENABLED:
+        return
+    user_ids = list_known_user_ids()
+    if not user_ids:
+        return
+    logger.info("Broadcasting online notice to %s user(s)", len(user_ids))
+    for user_id in user_ids:
+        try:
+            await app.bot.send_message(
+                chat_id=user_id,
+                text="I am back online.",
+            )
+        except Exception:
+            logger.debug("Failed to send online notice", extra={"user_id": user_id}, exc_info=True)
+
+
 def main():
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     init_storage()
 
-    app = ApplicationBuilder().token(token).post_stop(on_post_stop).build()
+    app = (
+        ApplicationBuilder()
+        .token(token)
+        .post_init(on_post_init)
+        .post_stop(on_post_stop)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
