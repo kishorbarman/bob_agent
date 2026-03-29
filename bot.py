@@ -7,7 +7,10 @@ from zoneinfo import ZoneInfo
 import wikipedia
 from duckduckgo_search import DDGS
 from anthropic import Anthropic
-from google_services import get_upcoming_events, search_calendar_events, get_recent_emails, search_emails
+from google_services import (
+    get_upcoming_events, search_calendar_events, get_recent_emails, search_emails,
+    get_nest_devices, get_thermostat_status, set_thermostat_temperature, get_camera_status
+)
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 
@@ -112,6 +115,33 @@ TOOLS = [
             },
             "required": ["word"]
         }
+    },
+    {
+        "name": "get_nest_devices",
+        "description": "List all Nest devices connected to the user's home.",
+        "input_schema": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+        "name": "get_thermostat_status",
+        "description": "Get the current temperature, humidity, mode and setpoint of the Nest thermostat.",
+        "input_schema": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+        "name": "set_thermostat_temperature",
+        "description": "Set the Nest thermostat to a target temperature.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "temperature": {"type": "number", "description": "Target temperature"},
+                "unit": {"type": "string", "description": "'celsius' or 'fahrenheit' (default: celsius)"}
+            },
+            "required": ["temperature"]
+        }
+    },
+    {
+        "name": "get_camera_status",
+        "description": "Get the status and connectivity of Nest cameras and doorbells.",
+        "input_schema": {"type": "object", "properties": {}, "required": []}
     },
     {
         "name": "get_upcoming_events",
@@ -307,6 +337,14 @@ def run_tool(name: str, tool_input: dict) -> str:
         return get_country_info(tool_input["country"])
     if name == "define_word":
         return define_word(tool_input["word"])
+    if name == "get_nest_devices":
+        return get_nest_devices()
+    if name == "get_thermostat_status":
+        return get_thermostat_status()
+    if name == "set_thermostat_temperature":
+        return set_thermostat_temperature(tool_input["temperature"], tool_input.get("unit", "celsius"))
+    if name == "get_camera_status":
+        return get_camera_status()
     if name == "get_upcoming_events":
         return get_upcoming_events(tool_input.get("max_results", 10))
     if name == "search_calendar_events":

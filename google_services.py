@@ -1,15 +1,15 @@
 import os
+import httpx
 from datetime import datetime, timezone
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-import base64
-import email
 
 SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/sdm.service",
 ]
 
 CREDENTIALS_FILE = "credentials.json"
@@ -139,3 +139,132 @@ def get_recent_emails(max_results: int = 5, query: str = "") -> str:
 
 def search_emails(query: str, max_results: int = 5) -> str:
     return get_recent_emails(max_results=max_results, query=query)
+
+
+# --- Nest ---
+
+NEST_PROJECT_ID = os.environ.get("NEST_PROJECT_ID", "")
+SDM_BASE = "https://smartdevicemanagement.googleapis.com/v1"
+
+
+def nest_get(path: str) -> dict:
+    creds = get_credentials()
+    response = httpx.get(
+        f"{SDM_BASE}/enterprises/{NEST_PROJECT_ID}/{path}",
+        headers={"Authorization": f"Bearer {creds.token}"},
+        timeout=10
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def nest_post(path: str, body: dict) -> dict:
+    creds = get_credentials()
+    response = httpx.post(
+        f"{SDM_BASE}/enterprises/{NEST_PROJECT_ID}/{path}",
+        headers={"Authorization": f"Bearer {creds.token}"},
+        json=body,
+        timeout=10
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def get_nest_devices() -> str:
+    data = nest_get("devices")
+    devices = data.get("devices", [])
+    if not devices:
+        return "No Nest devices found."
+    lines = []
+    for d in devices:
+        name = d.get("displayName") or d["name"].split("/")[-1]
+        device_type = d.get("type", "").split(".")[-1].replace("_", " ").title()
+        lines.append(f"• {name} ({device_type})")
+    return "\n".join(lines)
+
+
+def get_thermostat_status() -> str:
+    data = nest_get("devices")
+    devices = data.get("devices", [])
+    thermostats = [d for d in devices if "THERMOSTAT" in d.get("type", "")]
+    if not thermostats:
+        return "No Nest thermostat found."
+
+    lines = []
+    for t in thermostats:
+        traits = t.get("traits", {})
+        name = t.get("displayName") or t["name"].split("/")[-1]
+
+        temp = traits.get("sdm.devices.traits.Temperature", {})
+        humidity = traits.get("sdm.devices.traits.Humidity", {})
+        therm = traits.get("sdm.devices.traits.ThermostatMode", {})
+        hvac = traits.get("sdm.devices.traits.ThermostatHvac", {})
+        setpoint = traits.get("sdm.devices.traits.ThermostatTemperatureSetpoint", {})
+
+        ambient = temp.get("ambientTemperatureCelsius", "N/A")
+        hum = humidity.get("ambientHumidityPercent", "N/A")
+        mode = therm.get("mode", "N/A")
+        hvac_status = hvac.get("status", "N/A")
+        heat_sp = setpoint.get("heatCelsius", "")
+        cool_sp = setpoint.get("coolCelsius", "")
+
+        line = (
+            f"{name}\n"
+            f"  Temperature: {ambient}°C | Humidity: {hum}%\n"
+            f"  Mode: {mode} | HVAC: {hvac_status}"
+        )
+        if heat_sp:
+            line += f"\n  Heat setpoint: {heat_sp}°C"
+        if cool_sp:
+            line += f"\n  Cool setpoint: {cool_sp}°C"
+        lines.append(line)
+
+    return "\n\n".join(lines)
+
+
+def set_thermostat_temperature(temperature: float, unit: str = "celsius") -> str:
+    data = nest_get("devices")
+    devices = data.get("devices", [])
+    thermostats = [d for d in devices if "THERMOSTAT" in d.get("type", "")]
+    if not thermostats:
+        return "No Nest thermostat found."
+
+    thermostat = thermostats[0]
+    device_id = thermostat["name"].split("/")[-1]
+
+    if unit.lower() == "fahrenheit":
+        temperature = (temperature - 32) * 5 / 9
+
+    # Get current mode to determine which setpoint to use
+    traits = thermostat.get("traits", {})
+    mode = traits.get("sdm.devices.traits.ThermostatMode", {}).get("mode", "HEAT")
+
+    if mode == "HEAT":
+        body = {"command": "sdm.devices.commands.ThermostatTemperatureSetpoint.SetHeat",
+                "params": {"heatCelsius": round(temperature, 1)}}
+    elif mode == "COOL":
+        body = {"command": "sdm.devices.commands.ThermostatTemperatureSetpoint.SetCool",
+                "params": {"coolCelsius": round(temperature, 1)}}
+    else:
+        return f"Cannot set temperature while thermostat is in {mode} mode."
+
+    nest_post(f"devices/{device_id}:executeCommand", body)
+    return f"Thermostat set to {round(temperature, 1)}°C."
+
+
+def get_camera_status() -> str:
+    data = nest_get("devices")
+    devices = data.get("devices", [])
+    cameras = [d for d in devices if "CAMERA" in d.get("type", "") or "DOORBELL" in d.get("type", "")]
+    if not cameras:
+        return "No Nest cameras or doorbells found."
+
+    lines = []
+    for c in cameras:
+        traits = c.get("traits", {})
+        name = c.get("displayName") or c["name"].split("/")[-1]
+        device_type = c.get("type", "").split(".")[-1].replace("_", " ").title()
+        connectivity = traits.get("sdm.devices.traits.Connectivity", {}).get("status", "N/A")
+        lines.append(f"• {name} ({device_type}) — {connectivity}")
+
+    return "\n".join(lines)
