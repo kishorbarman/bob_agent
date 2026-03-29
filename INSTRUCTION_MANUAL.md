@@ -2,7 +2,7 @@
 
 ## 1) Overview
 
-Bob is an always-on Telegram assistant powered by Anthropic Claude, with optional Google integrations (Calendar, Gmail, Nest), plus Telegram UX upgrades (quick actions, guided menus, voice notes, and file/image understanding).
+Bob is an always-on Telegram assistant powered by Gemini, with optional Google integrations (Calendar, Gmail, Nest), plus Telegram UX upgrades (quick actions, guided menus, voice notes, and file/image understanding).
 
 This manual explains:
 - How to install and run Bob
@@ -15,7 +15,7 @@ This manual explains:
 
 - Python 3.9+
 - Telegram bot token (`TELEGRAM_BOT_TOKEN`)
-- Anthropic API key (`ANTHROPIC_API_KEY`)
+- Gemini API key (`GEMINI_API_KEY`)
 - Optional: Google OAuth credentials for Calendar/Gmail/Nest
 
 ## 3) Project Files
@@ -51,7 +51,7 @@ cp .env.example .env
 
 ```env
 TELEGRAM_BOT_TOKEN=...
-ANTHROPIC_API_KEY=...
+GEMINI_API_KEY=...
 ```
 
 4. Optional variables:
@@ -132,7 +132,7 @@ Preferences are saved in SQLite and survive bot restarts.
 2. Bob validates limits:
 - Max duration: 3 minutes
 - Max size: 5 MB
-3. Bob currently validates the voice note, then returns a clear fallback message in Anthropic-only mode.
+3. Bob currently validates the voice note, then returns a clear fallback message in this configuration.
 4. Text/image/PDF flows remain fully supported.
 
 ## 9) File and Image Flow (Phase 4)
@@ -147,7 +147,7 @@ Preferences are saved in SQLite and survive bot restarts.
 ### Processing behavior
 
 - Images:
-  - Sent to Claude vision for text extraction + summary
+  - Sent to Gemini vision for text extraction + summary
 - PDFs:
   - Text extracted with `pypdf`
   - Summarized into key points/action items
@@ -211,9 +211,9 @@ Current test coverage includes:
 - Confirm dependencies installed from `requirements.txt`
 - Run compile command to detect syntax/import issues
 
-### Anthropic errors
+### Gemini errors
 
-- Confirm `ANTHROPIC_API_KEY`
+- Confirm `GEMINI_API_KEY`
 - Check network connectivity
 - Check model name availability/permissions
 
@@ -225,7 +225,7 @@ Current test coverage includes:
 
 ### Voice does not transcribe
 
-- In the current Anthropic-only configuration, voice transcription is intentionally disabled.
+- In the current configuration, voice transcription is intentionally disabled.
 - Confirm voice note is under size/duration limits to avoid validation errors.
 
 ### File upload unsupported
@@ -271,7 +271,7 @@ To add a new tool:
 - Conversation history is still in-memory and not persisted in DB
 - Polling mode is used instead of webhooks
 - Some advanced media features rely on external model APIs
-- Voice transcription is currently disabled in Anthropic-only mode
+- Voice transcription is currently disabled in the current configuration
 - PDF extraction quality depends on embedded text quality
 
 ## 18) Recommended Next Hardening Steps

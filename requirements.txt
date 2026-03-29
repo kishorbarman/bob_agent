@@ -1,7 +1,7 @@
-anthropic
+google-genai
 python-telegram-bot
 httpx
-duckduckgo-search
+ddgs
 wikipedia
 google-auth-oauthlib
 google-api-python-client

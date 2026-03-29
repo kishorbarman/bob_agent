@@ -1,6 +1,6 @@
 # Bob — Personal AI Agent on Telegram
 
-Bob is a personal AI assistant that lives in Telegram. Powered by Claude, he can answer questions, search the web, check your calendar, read your emails, and more — all from a simple chat interface.
+Bob is a personal AI assistant that lives in Telegram. Powered by Gemini, he can answer questions, search the web, check your calendar, read your emails, and more — all from a simple chat interface.
 
 For complete operational instructions, see [`INSTRUCTION_MANUAL.md`](INSTRUCTION_MANUAL.md).
 
@@ -8,7 +8,7 @@ For complete operational instructions, see [`INSTRUCTION_MANUAL.md`](INSTRUCTION
 
 | Tool | What Bob can do |
 |------|----------------|
-| 💬 Chat | General Q&A, reasoning, writing — powered by Claude |
+| 💬 Chat | General Q&A, reasoning, writing — powered by Gemini |
 | 🎛 UX actions | Inline quick actions: search web, simplify, summarize, translate, retry |
 | 🧭 Command menu | `/help`, `/tools`, `/prefs` guided flows |
 | 🕐 Time | Current date and time in any timezone |
@@ -21,14 +21,14 @@ For complete operational instructions, see [`INSTRUCTION_MANUAL.md`](INSTRUCTION
 | 📚 Dictionary | Definitions, phonetics, examples |
 | 📅 Google Calendar | Upcoming events, search by keyword |
 | 📧 Gmail | Recent inbox emails, search by query |
-| 🎤 Voice | Voice note handling with Anthropic-only fallback messaging |
+| 🎤 Voice | Voice note handling with fallback messaging (transcription currently disabled) |
 | 🖼 Files & images | Image understanding, PDF/text summarization, file follow-up Q&A |
 
 ## Requirements
 
 - Python 3.9+
 - A Telegram bot token (from [@BotFather](https://t.me/BotFather))
-- An Anthropic API key
+- A Gemini API key
 - A Google Cloud project with Calendar and Gmail APIs enabled (for those features)
 
 ## Setup
@@ -52,7 +52,7 @@ cp .env.example .env
 Edit `.env`:
 ```
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-ANTHROPIC_API_KEY=your_anthropic_api_key
+GEMINI_API_KEY=your_gemini_api_key
 ```
 
 ### 3. Google Calendar & Gmail (optional)
@@ -118,10 +118,8 @@ bob_agent/
 
 - Incoming text messages are handled in `handle_message()`.
 - The bot keeps per-user conversation state in memory (`conversations` dict keyed by Telegram user ID).
-- Each request sends recent history to Anthropic (`claude-opus-4-6`) with a tool schema.
-- If Claude returns:
-  - `end_turn`: Bob replies directly in Telegram.
-  - `tool_use`: Bob executes one or more local tool calls, returns `tool_result`, and continues until `end_turn`.
+- Each request sends recent history to Gemini with tool definitions.
+- The agent loop executes tool/function calls when requested by the model, appends function responses, and continues until a final text response is produced.
 
 ### Tool Architecture
 
@@ -141,7 +139,7 @@ bob_agent/
 
 ### State, Auth, and External Dependencies
 
-- Bot/API credentials are loaded from environment variables (`TELEGRAM_BOT_TOKEN`, `ANTHROPIC_API_KEY`, `NEST_PROJECT_ID`).
+- Bot/API credentials are loaded from environment variables (`TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY`, `NEST_PROJECT_ID`).
 - Google OAuth uses:
   - `credentials.json` (OAuth client credentials)
   - `token.json` (persisted user access/refresh token)

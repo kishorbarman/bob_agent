@@ -1,17 +1,23 @@
-import base64
+import asyncio
 import logging
 import math
 import os
+import random
+import time
+import re
 import tempfile
+from contextlib import asynccontextmanager, suppress
 from functools import wraps
 from pathlib import Path
 
 import httpx
 import wikipedia
-from anthropic import Anthropic
-from duckduckgo_search import DDGS
+from google import genai
+from google.genai import types
+from ddgs import DDGS
 from pypdf import PdfReader
 from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -62,7 +68,8 @@ from telegram_ui import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-anthropic = Anthropic()
+gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+MODEL = "models/gemini-3.1-flash-lite-preview"
 
 # Per-user conversation history
 conversations: dict[int, list[dict]] = {}
@@ -71,6 +78,47 @@ SYSTEM_PROMPT = (
     "You are a helpful personal assistant called Bob. Be concise and direct. "
     "Use tools whenever they will give a better answer than your training data alone."
 )
+
+
+async def _chat_action_pulse(bot, chat_id: int, action: str = ChatAction.TYPING):
+    while True:
+        try:
+            await bot.send_chat_action(chat_id=chat_id, action=action)
+        except Exception:
+            logger.debug("Failed to send chat action", exc_info=True)
+        await asyncio.sleep(4)
+
+
+@asynccontextmanager
+async def processing_indicator(bot, chat_id: int, action: str = ChatAction.TYPING):
+    task = asyncio.create_task(_chat_action_pulse(bot, chat_id, action))
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+def gemini_generate_with_retry(model: str, contents, config, retries: int = 3):
+    base_delay = 1.0
+    for attempt in range(1, retries + 1):
+        try:
+            return gemini_client.models.generate_content(
+                model=model, contents=contents, config=config
+            )
+        except Exception as exc:
+            if attempt == retries:
+                raise
+            delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.4)
+            logger.warning(
+                "Gemini error (attempt %s/%s): %s. Retrying in %.2fs",
+                attempt,
+                retries,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
 
 TOOLS = [
     {
@@ -210,6 +258,41 @@ TOOLS = [
 ]
 
 
+def _schema_to_gemini(schema: dict) -> types.Schema:
+    type_map = {
+        "object": types.Type.OBJECT,
+        "string": types.Type.STRING,
+        "integer": types.Type.INTEGER,
+        "number": types.Type.NUMBER,
+        "boolean": types.Type.BOOLEAN,
+        "array": types.Type.ARRAY,
+    }
+    t = type_map.get(schema.get("type", "string"), types.Type.STRING)
+    kwargs: dict = {"type": t}
+    if "description" in schema:
+        kwargs["description"] = schema["description"]
+    if "properties" in schema:
+        kwargs["properties"] = {k: _schema_to_gemini(v) for k, v in schema["properties"].items()}
+    if schema.get("required"):
+        kwargs["required"] = schema["required"]
+    return types.Schema(**kwargs)
+
+
+def _build_gemini_tools(tools: list) -> list:
+    declarations = [
+        types.FunctionDeclaration(
+            name=tool["name"],
+            description=tool.get("description", ""),
+            parameters=_schema_to_gemini(tool["input_schema"]) if tool.get("input_schema", {}).get("properties") else None,
+        )
+        for tool in tools
+    ]
+    return [types.Tool(function_declarations=declarations)]
+
+
+GEMINI_TOOLS = _build_gemini_tools(TOOLS)
+
+
 def env_flag(name: str, default: bool) -> bool:
     raw = os.getenv(name, "true" if default else "false").strip().lower()
     return raw in {"1", "true", "yes", "y", "on"}
@@ -237,12 +320,8 @@ def handler_guard(func):
     return wrapper
 
 
-def extract_text_blocks(content: list) -> str:
-    parts: list[str] = []
-    for block in content:
-        if getattr(block, "type", "") == "text":
-            parts.append(block.text)
-    return "\n".join(parts).strip()
+def extract_text_from_parts(parts) -> str:
+    return "\n".join(p.text for p in parts if hasattr(p, "text") and p.text).strip()
 
 
 def style_reply(text: str, style: str) -> str:
@@ -304,19 +383,29 @@ def fetch_weather(city: str) -> str:
 
 
 def search_web(query: str, max_results: int = 5) -> str:
-    with DDGS() as ddgs:
-        results = list(ddgs.text(query, max_results=max_results))
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+    except Exception as exc:
+        logger.warning("Web search provider error for query=%r: %s", query, exc)
+        return "Web search is temporarily unavailable."
     if not results:
         return "No results found."
-    return "\n\n".join(f"{r['title']}\n{r['body']}\n{r['href']}" for r in results)
+    return "\n\n".join(f"{r.get('title', '')}\n{r.get('body', '')}\n{r.get('href', '')}" for r in results)
 
 
 def get_news(query: str, max_results: int = 5) -> str:
-    with DDGS() as ddgs:
-        results = list(ddgs.news(query, max_results=max_results))
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.news(query, max_results=max_results))
+    except Exception as exc:
+        logger.warning("News search provider error for query=%r: %s", query, exc)
+        return "News search is temporarily unavailable."
     if not results:
         return "No news found."
-    return "\n\n".join(f"{r['title']} ({r['date']})\n{r['body']}\n{r['url']}" for r in results)
+    return "\n\n".join(
+        f"{r.get('title', '')} ({r.get('date', '')})\n{r.get('body', '')}\n{r.get('url', '')}" for r in results
+    )
 
 
 def wikipedia_search(query: str) -> str:
@@ -424,13 +513,15 @@ def run_tool(name: str, tool_input: dict) -> str:
 
 
 def generate_short_model_response(instruction: str, text: str) -> str:
-    response = anthropic.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=512,
-        system="You are Bob. Be concise and clear.",
-        messages=[{"role": "user", "content": f"{instruction}\n\n{text}"}],
+    response = gemini_generate_with_retry(
+        model=MODEL,
+        contents=[types.Content(role="user", parts=[types.Part(text=f"{instruction}\n\n{text}")])],
+        config=types.GenerateContentConfig(
+            system_instruction="You are Bob. Be concise and clear.",
+            max_output_tokens=512,
+        ),
     )
-    return extract_text_blocks(response.content) or "I could not generate a response."
+    return response.text or "I could not generate a response."
 
 
 def generate_agent_response(user_id: int, user_text: str, force_web: bool = False) -> str:
@@ -442,36 +533,50 @@ def generate_agent_response(user_id: int, user_text: str, force_web: bool = Fals
     if force_web:
         prompt = f"Use web search to answer this with current info: {user_text}"
 
-    conversations[user_id].append({"role": "user", "content": prompt})
-    history = conversations[user_id][-20:]
+    conversations[user_id].append(
+        types.Content(role="user", parts=[types.Part(text=prompt)])
+    )
+    history = list(conversations[user_id][-20:])
 
     system_prompt = (
         f"{SYSTEM_PROMPT}\n"
         f"User preferences: language={prefs.language}, style={prefs.response_style}, timezone={prefs.timezone}."
     )
+    config = types.GenerateContentConfig(
+        system_instruction=system_prompt,
+        tools=GEMINI_TOOLS,
+        max_output_tokens=1024,
+    )
 
     while True:
-        response = anthropic.messages.create(
-            model="claude-opus-4-6",
-            max_tokens=1024,
-            system=system_prompt,
-            tools=TOOLS,
-            messages=history,
-        )
+        response = gemini_generate_with_retry(MODEL, history, config)
+        candidate = response.candidates[0]
 
-        if response.stop_reason == "end_turn":
-            reply = extract_text_blocks(response.content)
-            conversations[user_id].append({"role": "assistant", "content": response.content})
-            return style_reply(reply, prefs.response_style)
+        function_call_parts = [p for p in candidate.content.parts if p.function_call]
 
-        if response.stop_reason == "tool_use":
-            history.append({"role": "assistant", "content": response.content})
-            tool_results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    result = run_tool(block.name, block.input)
-                    tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
-            history.append({"role": "user", "content": tool_results})
+        if not function_call_parts:
+            reply = extract_text_from_parts(candidate.content.parts)
+            conversations[user_id].append(candidate.content)
+            return style_reply(reply or "I could not generate a response.", prefs.response_style)
+
+        history.append(candidate.content)
+        function_response_parts = []
+        for part in function_call_parts:
+            fc = part.function_call
+            try:
+                result = run_tool(fc.name, dict(fc.args))
+            except Exception as exc:
+                logger.exception("Tool execution failed: %s", fc.name)
+                result = f"Tool '{fc.name}' failed: {exc}"
+            function_response_parts.append(
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        name=fc.name,
+                        response={"result": result},
+                    )
+                )
+            )
+        history.append(types.Content(role="user", parts=function_response_parts))
 
 
 def summarize_for_preview(text: str, max_len: int = 700) -> str:
@@ -479,24 +584,19 @@ def summarize_for_preview(text: str, max_len: int = 700) -> str:
 
 
 def analyze_image(path: Path) -> str:
-    media_type = "image/jpeg"
-    if path.suffix.lower() == ".png":
-        media_type = "image/png"
-    b64 = base64.b64encode(path.read_bytes()).decode("utf-8")
-    response = anthropic.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=700,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Extract visible text first, then summarize this image in concise bullets."},
-                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
-                ],
-            }
+    mime_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+    image_bytes = path.read_bytes()
+    response = gemini_generate_with_retry(
+        model=MODEL,
+        contents=[
+            types.Content(role="user", parts=[
+                types.Part(text="Extract visible text first, then summarize this image in concise bullets."),
+                types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+            ])
         ],
+        config=types.GenerateContentConfig(max_output_tokens=700),
     )
-    return extract_text_blocks(response.content) or "I could not analyze that image."
+    return response.text or "I could not analyze that image."
 
 
 def summarize_document_text(text: str) -> str:
@@ -528,17 +628,20 @@ async def send_reply_with_actions(update: Update, user_prompt: str, reply_text: 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
+    chat_id = update.effective_chat.id
 
     if context.user_data.get("awaiting_tool_query") == "weather":
         context.user_data.pop("awaiting_tool_query", None)
-        weather = fetch_weather(text)
+        async with processing_indicator(context.bot, chat_id):
+            weather = await asyncio.to_thread(fetch_weather, text)
         out = render_card("weather", weather) if UX_PHASE2_ENABLED else weather
         await send_reply_with_actions(update, text, out)
         return
 
     if context.user_data.get("awaiting_tool_query") == "news":
         context.user_data.pop("awaiting_tool_query", None)
-        news = get_news(text, 5)
+        async with processing_indicator(context.bot, chat_id):
+            news = await asyncio.to_thread(get_news, text, 5)
         out = render_card("news", news) if UX_PHASE2_ENABLED else news
         await send_reply_with_actions(update, text, out)
         return
@@ -558,14 +661,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not artifact:
             await update.message.reply_text("No recent file context found.")
             return
-        answer = generate_short_model_response(
-            f"Answer the user question using only this artifact context:\n\n{artifact['content_text']}",
-            f"Question: {text}",
-        )
+        async with processing_indicator(context.bot, chat_id):
+            answer = await asyncio.to_thread(
+                generate_short_model_response,
+                f"Answer the user question using only this artifact context:\n\n{artifact['content_text']}",
+                f"Question: {text}",
+            )
         await send_reply_with_actions(update, text, answer)
         return
 
-    reply = generate_agent_response(user_id, text)
+    async with processing_indicator(context.bot, chat_id):
+        reply = await asyncio.to_thread(generate_agent_response, user_id, text)
     await send_reply_with_actions(update, text, reply)
 
 
@@ -584,7 +690,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "Voice transcription is currently unavailable in Anthropic-only mode. "
+        "Voice transcription is currently unavailable in this configuration. "
         "You can send text, images, or PDF files."
     )
 
@@ -602,7 +708,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await tg_file.download_to_drive(custom_path=str(temp_path))
-        summary = analyze_image(temp_path)
+        async with processing_indicator(context.bot, update.effective_chat.id):
+            summary = await asyncio.to_thread(analyze_image, temp_path)
     finally:
         if temp_path.exists():
             temp_path.unlink()
@@ -634,20 +741,21 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await tg_file.download_to_drive(custom_path=str(temp_path))
 
-        if doc_type == "image":
-            content = analyze_image(temp_path)
-            artifact_type = "image"
-        elif doc_type == "pdf":
-            extracted = extract_pdf_text(temp_path)
-            if not extracted.strip():
-                await update.message.reply_text("I could not extract text from that PDF.")
-                return
-            content = summarize_document_text(extracted)
-            artifact_type = "document"
-        else:
-            extracted = temp_path.read_text(errors="ignore")
-            content = summarize_document_text(extracted)
-            artifact_type = "document"
+        async with processing_indicator(context.bot, update.effective_chat.id):
+            if doc_type == "image":
+                content = await asyncio.to_thread(analyze_image, temp_path)
+                artifact_type = "image"
+            elif doc_type == "pdf":
+                extracted = await asyncio.to_thread(extract_pdf_text, temp_path)
+                if not extracted.strip():
+                    await update.message.reply_text("I could not extract text from that PDF.")
+                    return
+                content = await asyncio.to_thread(summarize_document_text, extracted)
+                artifact_type = "document"
+            else:
+                extracted = await asyncio.to_thread(temp_path.read_text, errors="ignore")
+                content = await asyncio.to_thread(summarize_document_text, extracted)
+                artifact_type = "document"
     finally:
         if temp_path.exists():
             temp_path.unlink()
@@ -717,15 +825,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Send a topic for news.")
         return
     if action == "tool_calendar":
-        text = get_upcoming_events(8)
+        async with processing_indicator(context.bot, query.message.chat_id):
+            text = await asyncio.to_thread(get_upcoming_events, 8)
         await query.message.reply_text(render_card("calendar", text) if UX_PHASE2_ENABLED else text)
         return
     if action == "tool_email":
-        text = get_recent_emails(5)
+        async with processing_indicator(context.bot, query.message.chat_id):
+            text = await asyncio.to_thread(get_recent_emails, 5)
         await query.message.reply_text(render_card("email", text) if UX_PHASE2_ENABLED else text)
         return
     if action == "tool_nest":
-        text = get_thermostat_status()
+        async with processing_indicator(context.bot, query.message.chat_id):
+            text = await asyncio.to_thread(get_thermostat_status)
         await query.message.reply_text(text)
         return
 
@@ -743,7 +854,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not text:
             await query.message.reply_text("No pending transcription found.")
             return
-        reply = generate_agent_response(user_id, text)
+        async with processing_indicator(context.bot, query.message.chat_id):
+            reply = await asyncio.to_thread(generate_agent_response, user_id, text)
         sent = await query.message.reply_text(reply)
         save_message_context(user_id, sent.message_id, text, reply)
         if UX_PHASE1_ENABLED:
@@ -760,10 +872,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Ask your question about the last uploaded file.")
             return
         if action == "artifact_summarize":
-            out = generate_short_model_response("Summarize this artifact in 5 concise bullets.", artifact["content_text"])
+            async with processing_indicator(context.bot, query.message.chat_id):
+                out = await asyncio.to_thread(
+                    generate_short_model_response,
+                    "Summarize this artifact in 5 concise bullets.",
+                    artifact["content_text"],
+                )
             await query.message.reply_text(out)
             return
-        out = generate_short_model_response("Extract actionable next steps from this artifact.", artifact["content_text"])
+        async with processing_indicator(context.bot, query.message.chat_id):
+            out = await asyncio.to_thread(
+                generate_short_model_response,
+                "Extract actionable next steps from this artifact.",
+                artifact["content_text"],
+            )
         await query.message.reply_text(out)
         return
 
@@ -777,22 +899,51 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         original_prompt = ctx["original_prompt"]
 
         if action == "simplify":
-            out = generate_short_model_response("Rewrite this answer in simpler language.", source_text)
+            async with processing_indicator(context.bot, query.message.chat_id):
+                out = await asyncio.to_thread(
+                    generate_short_model_response,
+                    "Rewrite this answer in simpler language.",
+                    source_text,
+                )
         elif action == "summarize":
-            out = generate_short_model_response("Summarize this in 3 to 5 bullets.", source_text)
+            async with processing_indicator(context.bot, query.message.chat_id):
+                out = await asyncio.to_thread(
+                    generate_short_model_response,
+                    "Summarize this in 3 to 5 bullets.",
+                    source_text,
+                )
         elif action == "translate":
             prefs = get_user_preferences(user_id)
-            out = generate_short_model_response(
-                f"Translate this to {prefs.language}. Keep formatting compact.", source_text
-            )
+            async with processing_indicator(context.bot, query.message.chat_id):
+                out = await asyncio.to_thread(
+                    generate_short_model_response,
+                    f"Translate this to {prefs.language}. Keep formatting compact.",
+                    source_text,
+                )
         elif action == "retry":
-            out = generate_agent_response(user_id, original_prompt, force_web=True)
+            async with processing_indicator(context.bot, query.message.chat_id):
+                out = await asyncio.to_thread(generate_agent_response, user_id, original_prompt, True)
         else:
-            web_results = search_web(original_prompt, 5)
-            out = generate_short_model_response(
-                "Create a concise answer from these web snippets and include source URLs.",
-                web_results,
+            async with processing_indicator(context.bot, query.message.chat_id):
+                web_results = await asyncio.to_thread(search_web, original_prompt, 5)
+            has_links = bool(re.search(r"https?://", web_results))
+            no_results = (
+                not web_results.strip()
+                or "No results found." in web_results
+                or not has_links
             )
+            if no_results:
+                out = (
+                    "I couldn't find web snippets for that query right now. "
+                    "Try rephrasing with more specific keywords, or tap Retry."
+                )
+            else:
+                async with processing_indicator(context.bot, query.message.chat_id):
+                    out = await asyncio.to_thread(
+                        generate_short_model_response,
+                        "Create a concise answer from these web snippets and include source URLs.",
+                        web_results,
+                    )
 
         sent = await query.message.reply_text(out)
         save_message_context(user_id, sent.message_id, original_prompt, out)

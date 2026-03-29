@@ -1,4 +1,4 @@
-# Telegram UX Upgrade Plan (Phases 1-4)
+# Bob Agent Implementation Plan
 
 ## Progress Tracker
 
@@ -52,7 +52,7 @@
 - Validation:
   - Voice handler compiles and is wired in dispatcher
   - Temp-file cleanup path implemented with `finally` block
-  - Note: in Anthropic-only mode, voice transcription currently returns a graceful fallback message
+  - Note: in the current configuration, voice transcription currently returns a graceful fallback message
 
 ### Phase 4: File and Image UX
 
@@ -61,7 +61,7 @@
   - Added photo handler (`filters.PHOTO`)
   - Added document handler (`filters.Document.ALL`)
   - Added MIME/type detection (`media_utils.py`)
-  - Added image analysis pipeline (Anthropic vision)
+  - Added image analysis pipeline (Gemini vision)
   - Added PDF/text extraction pipeline (`pypdf` + summarization)
   - Added artifact action buttons (`Summarize`, `Extract action items`, `Ask question`)
   - Added artifact context binding and follow-up Q&A on latest artifact
@@ -331,3 +331,126 @@ We’ll implement all 4 phases in sequence with safe increments, feature flags, 
 2. Test suite green with added coverage for callbacks/media flows
 3. Soak test passes with no critical errors
 4. README updated with new UX features and usage examples
+
+---
+
+## Future Tracks Roadmap
+
+The UX track is complete. The following tracks are planned for future implementation.
+
+### Track A: Reliability and Operations
+
+- Status: Planned
+- Goal: Make the bot resilient under API failures, restarts, and long-running workloads.
+- Scope:
+  - Persist conversation history in SQLite/Postgres (survive restarts)
+  - Add retries/timeouts/circuit-breakers and graceful fallbacks for all external calls
+  - Add process supervision (`systemd` or Docker) with health checks and auto-restart
+  - Add structured logging and alerting (Slack/Telegram) for critical failures
+- Validation:
+  - 24-hour soak with no crash loops
+  - Forced API failure simulation and graceful degradation verified
+  - Recovery after process restart with preserved conversation continuity
+
+### Track B: Proactive Assistant Behaviors
+
+- Status: Planned
+- Goal: Move from reactive Q&A to proactive assistance.
+- Scope:
+  - Daily morning brief (calendar, weather, priority email)
+  - Watchers (price drops, news keywords, flight/package status)
+  - Scheduled reminders and nudges from calendar context
+- Validation:
+  - Scheduler reliability over multiple days
+  - Dedupe logic for repeated events
+  - Missed-run recovery behavior verified
+
+### Track C: Work Assistant Depth
+
+- Status: Planned
+- Goal: Turn Bob into a practical daily work copilot.
+- Scope:
+  - Gmail triage summaries and labeling suggestions
+  - Draft/reply assistance with editable output
+  - Calendar copilot (slot proposals, meeting prep briefs)
+  - Command-center summary thread with priorities and follow-ups
+- Validation:
+  - Draft quality reviewed on real inbox samples
+  - Calendar slot suggestions respect constraints
+  - End-to-end workflows complete with <3 user interactions
+
+### Track D: Home Automation Expansion
+
+- Status: Planned
+- Goal: Extend beyond basic Nest reads into useful routines.
+- Scope:
+  - Routine macros (e.g., “I’m leaving”, “Good night”)
+  - Context-aware actions (time/occupancy/temperature)
+  - Integrations for Home Assistant / Philips Hue / smart plugs
+- Validation:
+  - Safe command guardrails for home controls
+  - Routine dry-run mode and confirmation prompts
+  - Device state reconciliation after command execution
+
+### Track E: Memory and Personalization
+
+- Status: Planned
+- Goal: Improve personalization and long-term usefulness.
+- Scope:
+  - Long-term memory store (people, projects, preferences)
+  - Response style adaptation from explicit/implicit signals
+  - “Don’t ask again” and preference learning patterns
+- Validation:
+  - Memory retrieval relevance scoring
+  - Preference persistence across sessions/restarts
+  - User override controls and memory edit/delete flow
+
+### Track F: Security and Control
+
+- Status: Planned
+- Goal: Ensure safe usage as capabilities expand.
+- Scope:
+  - Telegram allowlist (trusted user IDs only)
+  - Confirm-before-action for risky operations
+  - Full audit log for tool calls and changes
+- Validation:
+  - Unauthorized user requests blocked
+  - Risky actions require explicit confirmation
+  - Audit entries complete and queryable
+
+### Track G: Additional Integrations
+
+- Status: Planned
+- Goal: Connect Bob to core personal/work platforms.
+- Scope:
+  - Notion, Todoist, Linear, GitHub, Google Drive, Slack
+  - Travel, finance/portfolio, shopping/price tracking APIs
+  - Optional custom internal APIs
+- Validation:
+  - Contract tests for each integration
+  - Rate-limit and token-expiry handling
+  - Common workflows verified end-to-end
+
+---
+
+## Future Track Execution Order
+
+1. Track A: Reliability and Operations
+2. Track F: Security and Control
+3. Track B: Proactive Assistant Behaviors
+4. Track C: Work Assistant Depth
+5. Track E: Memory and Personalization
+6. Track G: Additional Integrations
+7. Track D: Home Automation Expansion
+
+---
+
+## Future Track Milestone Template
+
+Use this template when starting any new track.
+
+1. Define scope and non-goals
+2. Add feature flags and rollout strategy
+3. Implement in small phases with tests per phase
+4. Run regression + soak checks
+5. Update this document with status, validation evidence, and follow-ups
