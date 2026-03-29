@@ -2,11 +2,15 @@
 
 Bob is a personal AI assistant that lives in Telegram. Powered by Claude, he can answer questions, search the web, check your calendar, read your emails, and more — all from a simple chat interface.
 
+For complete operational instructions, see [`INSTRUCTION_MANUAL.md`](INSTRUCTION_MANUAL.md).
+
 ## Capabilities
 
 | Tool | What Bob can do |
 |------|----------------|
 | 💬 Chat | General Q&A, reasoning, writing — powered by Claude |
+| 🎛 UX actions | Inline quick actions: search web, simplify, summarize, translate, retry |
+| 🧭 Command menu | `/help`, `/tools`, `/prefs` guided flows |
 | 🕐 Time | Current date and time in any timezone |
 | 🌤 Weather | Current conditions + 3-day forecast for any city |
 | 🔍 Web search | Search the web via DuckDuckGo |
@@ -17,6 +21,8 @@ Bob is a personal AI assistant that lives in Telegram. Powered by Claude, he can
 | 📚 Dictionary | Definitions, phonetics, examples |
 | 📅 Google Calendar | Upcoming events, search by keyword |
 | 📧 Gmail | Recent inbox emails, search by query |
+| 🎤 Voice | Voice note handling with Anthropic-only fallback messaging |
+| 🖼 Files & images | Image understanding, PDF/text summarization, file follow-up Q&A |
 
 ## Requirements
 
@@ -26,6 +32,8 @@ Bob is a personal AI assistant that lives in Telegram. Powered by Claude, he can
 - A Google Cloud project with Calendar and Gmail APIs enabled (for those features)
 
 ## Setup
+
+If you want the full setup + operations guide (including troubleshooting and validation), read [`INSTRUCTION_MANUAL.md`](INSTRUCTION_MANUAL.md).
 
 ### 1. Install dependencies
 
@@ -79,6 +87,9 @@ tmux attach -t bob           # reattach later
 | Command | Action |
 |---------|--------|
 | `/start` | Greet Bob and reset conversation |
+| `/help` | Show capabilities and example prompts |
+| `/tools` | Open one-tap tool launcher |
+| `/prefs` | Update response style, language, and timezone |
 | `/reset` | Clear conversation history |
 
 ## Project Structure
@@ -87,12 +98,62 @@ tmux attach -t bob           # reattach later
 bob_agent/
 ├── bot.py               # Main bot — tools, handlers, agentic loop
 ├── google_services.py   # Google Calendar & Gmail integration
+├── INSTRUCTION_MANUAL.md # Detailed setup, usage, troubleshooting manual
 ├── requirements.txt     # Python dependencies
 ├── .env                 # Your API keys (never commit this)
 ├── .env.example         # Example env file
 ├── credentials.json     # Google OAuth credentials (never commit this)
 └── token.json           # Google OAuth token (auto-generated)
 ```
+
+## Codebase Model
+
+### Runtime & Process Model
+
+- `bot.py` is the main entrypoint and runs a long-lived Telegram polling loop (`app.run_polling()`).
+- The bot is "always on" by keeping this Python process alive (for example via `tmux`).
+- Message handling is asynchronous through `python-telegram-bot` handlers.
+
+### Agentic Loop
+
+- Incoming text messages are handled in `handle_message()`.
+- The bot keeps per-user conversation state in memory (`conversations` dict keyed by Telegram user ID).
+- Each request sends recent history to Anthropic (`claude-opus-4-6`) with a tool schema.
+- If Claude returns:
+  - `end_turn`: Bob replies directly in Telegram.
+  - `tool_use`: Bob executes one or more local tool calls, returns `tool_result`, and continues until `end_turn`.
+
+### Tool Architecture
+
+- Tool declarations and dispatch logic live in `bot.py` (`TOOLS` + `run_tool()`).
+- Local utility/API tools in `bot.py` include:
+  - time (`zoneinfo`)
+  - weather (Open-Meteo)
+  - web/news search (DuckDuckGo)
+  - Wikipedia
+  - calculator
+  - country info
+  - dictionary
+- Google/Nest integrations are separated into `google_services.py`:
+  - Google Calendar (upcoming/search)
+  - Gmail (recent/search)
+  - Nest SDM devices, thermostat, cameras
+
+### State, Auth, and External Dependencies
+
+- Bot/API credentials are loaded from environment variables (`TELEGRAM_BOT_TOKEN`, `ANTHROPIC_API_KEY`, `NEST_PROJECT_ID`).
+- Google OAuth uses:
+  - `credentials.json` (OAuth client credentials)
+  - `token.json` (persisted user access/refresh token)
+- Current conversation memory is in-process only and is reset when the bot restarts.
+
+### Current Operational Notes
+
+- The bot is currently single-process and polling-based (not webhook-based).
+- It has good functional breadth, but limited production hardening by default:
+  - in-memory chat history
+  - no built-in process supervisor
+  - minimal explicit retry/backoff strategy across external API calls
 
 ## Adding New Tools
 

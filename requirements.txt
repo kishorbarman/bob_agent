@@ -5,3 +5,4 @@ duckduckgo-search
 wikipedia
 google-auth-oauthlib
 google-api-python-client
+pypdf

@@ -193,7 +193,7 @@ def get_thermostat_status() -> str:
     lines = []
     for t in thermostats:
         traits = t.get("traits", {})
-        name = t.get("displayName") or t["name"].split("/")[-1]
+        name = t.get("traits", {}).get("sdm.devices.traits.Info", {}).get("customName") or t.get("displayName") or "Thermostat"
 
         temp = traits.get("sdm.devices.traits.Temperature", {})
         humidity = traits.get("sdm.devices.traits.Humidity", {})
