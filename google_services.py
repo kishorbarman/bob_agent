@@ -1,6 +1,13 @@
+import asyncio
+import io
+import logging
 import os
+import subprocess
+import tempfile
 import httpx
 from datetime import datetime, timezone
+
+_gs_logger = logging.getLogger(__name__)
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -177,7 +184,11 @@ def get_nest_devices() -> str:
         return "No Nest devices found."
     lines = []
     for d in devices:
-        name = d.get("displayName") or d["name"].split("/")[-1]
+        name = (
+            d.get("traits", {}).get("sdm.devices.traits.Info", {}).get("customName")
+            or d.get("displayName")
+            or d["name"].split("/")[-1]
+        )
         device_type = d.get("type", "").split(".")[-1].replace("_", " ").title()
         lines.append(f"• {name} ({device_type})")
     return "\n".join(lines)
@@ -252,6 +263,211 @@ def set_thermostat_temperature(temperature: float, unit: str = "celsius") -> str
     return f"Thermostat set to {round(temperature, 1)}°C."
 
 
+def _fix_nest_sdp(sdp: str) -> str:
+    """Fix non-standard ICE candidate lines in Nest's answer SDP.
+
+    Nest omits the foundation and uses an empty field with a leading space:
+      a=candidate: 1 udp priority addr port typ type
+    RFC 5245 standard requires a non-empty foundation:
+      a=candidate:0 1 udp priority addr port typ type
+    aiortc's parser splits on whitespace after stripping 'candidate:', so
+    with an empty foundation bits[0]='1' (component) and bits[1]='udp' (protocol),
+    causing int(bits[1]) to raise ValueError.
+    """
+    fixed = []
+    for line in sdp.splitlines():
+        if line.startswith("a=candidate:"):
+            after_colon = line[len("a=candidate:"):]
+            # Empty foundation: leading space means no foundation token
+            if after_colon.startswith(" "):
+                line = "a=candidate:0" + after_colon
+        fixed.append(line)
+    return "\r\n".join(fixed)
+
+
+async def _webrtc_capture_frame(device_id):
+    """Establish a WebRTC connection to the Nest camera and return one JPEG frame."""
+    from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
+
+    _gs_logger.info("WebRTC: starting for device %s", device_id)
+
+    pc = RTCPeerConnection(configuration=RTCConfiguration(
+        iceServers=[RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
+    ))
+
+    loop = asyncio.get_running_loop()
+    track_future = loop.create_future()
+    media_session_id = ""
+
+    @pc.on("track")
+    def on_track(track):
+        _gs_logger.info("WebRTC: received track kind=%s", track.kind)
+        if track.kind == "video" and not track_future.done():
+            track_future.set_result(track)
+
+    try:
+        # Nest requires audio, video, and application m-lines in that exact order
+        pc.addTransceiver("audio", direction="recvonly")
+        pc.addTransceiver("video", direction="recvonly")
+        pc.createDataChannel("dataSendChannel")
+        offer = await pc.createOffer()
+        await pc.setLocalDescription(offer)
+
+        sdp = pc.localDescription.sdp
+        _gs_logger.info("WebRTC: SDP offer snippet: %s", sdp[:300].replace("\r\n", " | "))
+        _gs_logger.info("WebRTC: sending SDP offer to Nest API")
+
+        try:
+            stream_data = await loop.run_in_executor(
+                None,
+                lambda: nest_post(
+                    f"devices/{device_id}:executeCommand",
+                    {
+                        "command": "sdm.devices.commands.CameraLiveStream.GenerateWebRtcStream",
+                        "params": {"offerSdp": sdp},
+                    },
+                ),
+            )
+        except Exception as exc:
+            response_body = getattr(getattr(exc, "response", None), "text", "")
+            _gs_logger.error("WebRTC: Nest API call failed: %s | body: %s", exc, response_body)
+            return None, f"Failed to start WebRTC stream: {exc}"
+
+        answer_sdp = stream_data.get("results", {}).get("answerSdp", "")
+        media_session_id = stream_data.get("results", {}).get("mediaSessionId", "")
+        _gs_logger.info("WebRTC: got answer SDP (len=%d), mediaSessionId=%s", len(answer_sdp), media_session_id)
+
+        if not answer_sdp:
+            return None, "Camera did not return a WebRTC answer SDP."
+
+        answer_sdp = _fix_nest_sdp(answer_sdp)
+        _gs_logger.info("WebRTC: setting remote description")
+        await pc.setRemoteDescription(RTCSessionDescription(sdp=answer_sdp, type="answer"))
+        _gs_logger.info("WebRTC: remote description set, waiting for video track")
+
+        video_track = await asyncio.wait_for(track_future, timeout=15)
+        _gs_logger.info("WebRTC: video track received, capturing frames")
+
+        frame = None
+        for i in range(5):
+            frame = await asyncio.wait_for(video_track.recv(), timeout=8)
+            _gs_logger.info("WebRTC: received frame %d", i + 1)
+
+        img = frame.to_image()
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        image_bytes = buf.getvalue()
+        _gs_logger.info("WebRTC: captured JPEG, size=%d bytes", len(image_bytes))
+        return image_bytes, None
+
+    except asyncio.TimeoutError:
+        error = "Timed out waiting for doorbell video feed. The camera may be initialising or offline."
+        _gs_logger.warning("WebRTC: %s", error)
+        return None, error
+    except Exception as exc:
+        _gs_logger.error("WebRTC: capture error: %s", exc, exc_info=True)
+        return None, f"WebRTC capture error: {exc}"
+    finally:
+        if media_session_id:
+            try:
+                await loop.run_in_executor(
+                    None,
+                    lambda: nest_post(
+                        f"devices/{device_id}:executeCommand",
+                        {
+                            "command": "sdm.devices.commands.CameraLiveStream.StopWebRtcStream",
+                            "params": {"mediaSessionId": media_session_id},
+                        },
+                    ),
+                )
+            except Exception:
+                pass
+        await pc.close()
+
+
+def get_doorbell_snapshot():
+    """Capture a JPEG snapshot from the doorbell camera.
+
+    Supports both RTSP (older cameras) and WebRTC (newer Nest Doorbells).
+    Returns (bytes, None) on success or (None, error_message) on failure.
+    """
+    data = nest_get("devices")
+    devices = data.get("devices", [])
+    doorbell = next(
+        (d for d in devices if "DOORBELL" in d.get("type", "") or "doorbell" in d.get("displayName", "").lower()),
+        None,
+    )
+    if not doorbell:
+        return None, "No Nest doorbell found."
+
+    traits = doorbell.get("traits", {})
+    live_stream_trait = traits.get("sdm.devices.traits.CameraLiveStream", {})
+    if not live_stream_trait:
+        return None, "Doorbell does not support live streaming via the Device Access API."
+
+    supported_protocols = live_stream_trait.get("supportedProtocols", [])
+    device_id = doorbell["name"].split("/")[-1]
+
+    if "RTSP" in supported_protocols:
+        return _snapshot_via_rtsp(device_id)
+
+    if "WEB_RTC" in supported_protocols:
+        # asyncio.run() is safe here because get_doorbell_snapshot is always
+        # called from a worker thread (via asyncio.to_thread), never from
+        # the main async event loop.
+        try:
+            return asyncio.run(_webrtc_capture_frame(device_id))
+        except Exception as exc:
+            _gs_logger.error("WebRTC: asyncio.run failed: %s", exc, exc_info=True)
+            return None, f"WebRTC snapshot failed: {exc}"
+
+    return None, f"Unsupported streaming protocols: {supported_protocols}"
+
+
+def _snapshot_via_rtsp(device_id):
+    """Grab a single JPEG frame from an RTSP stream using ffmpeg."""
+    try:
+        stream_data = nest_post(
+            f"devices/{device_id}:executeCommand",
+            {"command": "sdm.devices.commands.CameraLiveStream.GenerateRtspStream", "params": {}},
+        )
+    except Exception as exc:
+        return None, f"Failed to start RTSP stream: {exc}"
+
+    rtsp_url = stream_data.get("results", {}).get("streamUrls", {}).get("rtspUrl")
+    stream_extension_token = stream_data.get("results", {}).get("streamExtensionToken", "")
+    if not rtsp_url:
+        return None, "RTSP stream started but no URL was returned."
+
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+        tmp_path = f.name
+
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-rtsp_transport", "tcp", "-i", rtsp_url,
+             "-vframes", "1", "-q:v", "2", tmp_path],
+            capture_output=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.decode(errors="ignore")[-300:]
+            _gs_logger.error("ffmpeg error: %s", stderr)
+            return None, f"Failed to capture RTSP frame: {stderr}"
+        with open(tmp_path, "rb") as f:
+            return f.read(), None
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        try:
+            nest_post(
+                f"devices/{device_id}:executeCommand",
+                {"command": "sdm.devices.commands.CameraLiveStream.StopRtspStream",
+                 "params": {"streamExtensionToken": stream_extension_token}},
+            )
+        except Exception:
+            pass
+
+
 def get_camera_status() -> str:
     data = nest_get("devices")
     devices = data.get("devices", [])
@@ -262,7 +478,11 @@ def get_camera_status() -> str:
     lines = []
     for c in cameras:
         traits = c.get("traits", {})
-        name = c.get("displayName") or c["name"].split("/")[-1]
+        name = (
+            traits.get("sdm.devices.traits.Info", {}).get("customName")
+            or c.get("displayName")
+            or c["name"].split("/")[-1]
+        )
         device_type = c.get("type", "").split(".")[-1].replace("_", " ").title()
         connectivity = traits.get("sdm.devices.traits.Connectivity", {}).get("status", "N/A")
         lines.append(f"• {name} ({device_type}) — {connectivity}")

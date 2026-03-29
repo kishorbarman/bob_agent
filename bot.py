@@ -767,7 +767,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async with processing_indicator(context.bot, chat_id):
         reply, snapshot_path = await asyncio.to_thread(generate_agent_response, user_id, text)
+
     if snapshot_path:
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
         await update.message.reply_photo(photo=open(snapshot_path, "rb"), caption=reply)
         os.unlink(snapshot_path)
     else:
