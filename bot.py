@@ -49,6 +49,7 @@ from media_utils import detect_document_type
 from storage import (
     clear_pending_transcription,
     get_latest_artifact,
+    list_known_user_ids,
     get_message_context,
     get_pending_transcription,
     init_storage,
@@ -315,6 +316,7 @@ UX_PHASE1_ENABLED = env_flag("UX_PHASE1_ENABLED", True)
 UX_PHASE2_ENABLED = env_flag("UX_PHASE2_ENABLED", True)
 UX_PHASE3_ENABLED = env_flag("UX_PHASE3_ENABLED", True)
 UX_PHASE4_ENABLED = env_flag("UX_PHASE4_ENABLED", True)
+OFFLINE_BROADCAST_ENABLED = env_flag("OFFLINE_BROADCAST_ENABLED", True)
 
 
 def handler_guard(func):
@@ -322,15 +324,64 @@ def handler_guard(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             return await func(update, context)
-        except Exception:
+        except Exception as exc:
             logger.exception("Handler failed", extra={"handler": func.__name__})
+            if is_offline_error(exc):
+                message = (
+                    "Bob is currently offline. Please try again in a minute."
+                )
+            else:
+                message = "I hit an unexpected error. Please try again."
             if update.callback_query:
                 await update.callback_query.answer("Something went wrong. Please try again.")
-                await update.callback_query.message.reply_text("I hit an unexpected error. Please try again.")
+                await update.callback_query.message.reply_text(message)
             elif update.message:
-                await update.message.reply_text("I hit an unexpected error. Please try again.")
+                await update.message.reply_text(message)
 
     return wrapper
+
+
+def _iter_exception_chain(exc: Exception):
+    current = exc
+    visited = set()
+    while current and id(current) not in visited:
+        visited.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def is_offline_error(exc: Exception) -> bool:
+    offline_markers = (
+        "overloaded",
+        "service unavailable",
+        "temporarily unavailable",
+        "timed out",
+        "timeout",
+        "connection error",
+        "connection reset",
+        "network is unreachable",
+        "503",
+        "529",
+    )
+    offline_types = {
+        "OverloadedError",
+        "ServiceUnavailableError",
+        "APIConnectionError",
+        "ConnectError",
+        "ReadTimeout",
+        "WriteTimeout",
+        "RemoteProtocolError",
+        "NetworkError",
+        "TimeoutException",
+    }
+    for item in _iter_exception_chain(exc):
+        name = type(item).__name__
+        text = str(item).lower()
+        if name in offline_types:
+            return True
+        if any(marker in text for marker in offline_markers):
+            return True
+    return False
 
 
 def extract_text_from_parts(parts) -> str:
@@ -1245,11 +1296,28 @@ def format_all_tools_text() -> str:
     )
 
 
+async def on_post_stop(app):
+    if not OFFLINE_BROADCAST_ENABLED:
+        return
+    user_ids = list_known_user_ids()
+    if not user_ids:
+        return
+    logger.info("Broadcasting offline notice to %s user(s)", len(user_ids))
+    for user_id in user_ids:
+        try:
+            await app.bot.send_message(
+                chat_id=user_id,
+                text="Bob is currently offline. I will be back soon.",
+            )
+        except Exception:
+            logger.debug("Failed to send offline notice", extra={"user_id": user_id}, exc_info=True)
+
+
 def main():
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     init_storage()
 
-    app = ApplicationBuilder().token(token).build()
+    app = ApplicationBuilder().token(token).post_stop(on_post_stop).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))

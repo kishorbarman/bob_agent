@@ -226,3 +226,22 @@ def get_latest_artifact(user_id: int) -> Optional[dict[str, Any]]:
             "SELECT * FROM artifacts WHERE user_id = ? ORDER BY id DESC LIMIT 1", (user_id,)
         ).fetchone()
     return dict(row) if row else None
+
+
+def list_known_user_ids() -> list[int]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT user_id FROM user_preferences
+            UNION
+            SELECT DISTINCT user_id FROM message_contexts
+            UNION
+            SELECT DISTINCT user_id FROM callback_events
+            UNION
+            SELECT DISTINCT user_id FROM pending_transcriptions
+            UNION
+            SELECT DISTINCT user_id FROM artifacts
+            ORDER BY user_id
+            """
+        ).fetchall()
+    return [int(r["user_id"]) for r in rows if r["user_id"] is not None]
