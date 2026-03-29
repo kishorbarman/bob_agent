@@ -80,6 +80,7 @@ def tools_category_keyboard(category: str) -> InlineKeyboardMarkup:
             [InlineKeyboardButton("Nest Devices", callback_data=make_callback("tool_nest_devices"))],
             [InlineKeyboardButton("Thermostat Status", callback_data=make_callback("tool_nest"))],
             [InlineKeyboardButton("Camera Status", callback_data=make_callback("tool_camera_status"))],
+            [InlineKeyboardButton("Camera Snapshot", callback_data=make_callback("tool_camera_snapshot"))],
             [InlineKeyboardButton("Doorbell Snapshot", callback_data=make_callback("tool_doorbell_snapshot"))],
         ]
     elif category == "utilities":

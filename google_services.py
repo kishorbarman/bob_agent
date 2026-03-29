@@ -424,6 +424,77 @@ def get_doorbell_snapshot():
     return None, f"Unsupported streaming protocols: {supported_protocols}"
 
 
+def _normalize_camera_label(value: str) -> str:
+    return " ".join((value or "").lower().strip().split())
+
+
+def _camera_display_name(device: dict) -> str:
+    traits = device.get("traits", {})
+    return (
+        traits.get("sdm.devices.traits.Info", {}).get("customName")
+        or device.get("displayName")
+        or device.get("name", "").split("/")[-1]
+    )
+
+
+def _find_camera_device(devices: list[dict], camera_name: str = ""):
+    cameras = [d for d in devices if "CAMERA" in d.get("type", "") or "DOORBELL" in d.get("type", "")]
+    if not cameras:
+        return None, "No Nest cameras or doorbells found."
+
+    query = _normalize_camera_label(camera_name)
+    if not query:
+        return cameras[0], None
+
+    scored = []
+    for cam in cameras:
+        label = _normalize_camera_label(_camera_display_name(cam))
+        if label == query:
+            return cam, None
+        if query in label or label in query:
+            scored.append(cam)
+
+    if scored:
+        return scored[0], None
+
+    available = ", ".join(_camera_display_name(c) for c in cameras)
+    return None, f"Camera '{camera_name}' not found. Available cameras: {available}"
+
+
+def get_camera_snapshot(camera_name: str = ""):
+    """Capture a JPEG snapshot from a named Nest camera (or first available camera)."""
+    data = nest_get("devices")
+    devices = data.get("devices", [])
+    camera, error = _find_camera_device(devices, camera_name)
+    if error:
+        return None, error
+
+    traits = camera.get("traits", {})
+    live_stream_trait = traits.get("sdm.devices.traits.CameraLiveStream", {})
+    if not live_stream_trait:
+        label = _camera_display_name(camera)
+        return None, f"{label} does not support live streaming via the Device Access API."
+
+    supported_protocols = live_stream_trait.get("supportedProtocols", [])
+    device_id = camera["name"].split("/")[-1]
+    camera_label = _camera_display_name(camera)
+
+    if "RTSP" in supported_protocols:
+        image_bytes, snapshot_error = _snapshot_via_rtsp(device_id)
+        if snapshot_error:
+            return None, snapshot_error
+        return image_bytes, None
+
+    if "WEB_RTC" in supported_protocols:
+        try:
+            return asyncio.run(_webrtc_capture_frame(device_id))
+        except Exception as exc:
+            _gs_logger.error("WebRTC: asyncio.run failed: %s", exc, exc_info=True)
+            return None, f"WebRTC snapshot failed for {camera_label}: {exc}"
+
+    return None, f"Unsupported streaming protocols for {camera_label}: {supported_protocols}"
+
+
 def _snapshot_via_rtsp(device_id):
     """Grab a single JPEG frame from an RTSP stream using ffmpeg."""
     try:

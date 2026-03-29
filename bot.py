@@ -28,6 +28,7 @@ from telegram.ext import (
 )
 
 from google_services import (
+    get_camera_snapshot,
     get_camera_status,
     get_doorbell_snapshot,
     get_nest_devices,
@@ -89,7 +90,8 @@ _snapshot_queue: dict[int, str] = {}
 
 SYSTEM_PROMPT = (
     "You are a helpful personal assistant called Bob. Be concise and direct. "
-    "Use tools whenever they will give a better answer than your training data alone."
+    "Use tools whenever they will give a better answer than your training data alone. "
+    "If the user asks to see a camera view, call the camera snapshot tool instead of apologizing."
 )
 
 
@@ -240,6 +242,20 @@ TOOLS = [
         },
     },
     {"name": "get_camera_status", "description": "Get Nest camera status.", "input_schema": {"type": "object", "properties": {}, "required": []}},
+    {
+        "name": "get_camera_snapshot",
+        "description": "Capture a live snapshot photo from a Nest camera. Use this when the user asks to see a specific camera view.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "camera_name": {
+                    "type": "string",
+                    "description": "Camera label, e.g. 'Front of Garage'. Optional: if omitted, use first camera.",
+                }
+            },
+            "required": [],
+        },
+    },
     {"name": "get_doorbell_snapshot", "description": "Capture a live snapshot photo from the Nest doorbell camera.", "input_schema": {"type": "object", "properties": {}, "required": []}},
     {
         "name": "get_upcoming_events",
@@ -551,6 +567,18 @@ def _capture_doorbell_snapshot(user_id: int) -> str:
     return "Doorbell snapshot captured."
 
 
+def _capture_camera_snapshot(user_id: int, camera_name: str = "") -> str:
+    image_bytes, error = get_camera_snapshot(camera_name)
+    if error:
+        return error
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+        f.write(image_bytes)
+        _snapshot_queue[user_id] = f.name
+    if camera_name:
+        return f"Snapshot captured from {camera_name}."
+    return "Camera snapshot captured."
+
+
 def run_tool(name: str, tool_input: dict, user_id: int = 0) -> str:
     if name == "get_current_time":
         return get_current_time(tool_input.get("timezone", ""))
@@ -576,6 +604,8 @@ def run_tool(name: str, tool_input: dict, user_id: int = 0) -> str:
         return set_thermostat_temperature(tool_input["temperature"], tool_input.get("unit", "celsius"))
     if name == "get_camera_status":
         return get_camera_status()
+    if name == "get_camera_snapshot":
+        return _capture_camera_snapshot(user_id, tool_input.get("camera_name", ""))
     if name == "get_doorbell_snapshot":
         return _capture_doorbell_snapshot(user_id)
     if name == "get_upcoming_events":
@@ -736,9 +766,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif pending_tool == "tool_email_search":
                 raw = await asyncio.to_thread(search_emails, text, 5)
                 out = render_card("email", raw) if UX_PHASE2_ENABLED else raw
+            elif pending_tool == "tool_camera_snapshot":
+                out = await asyncio.to_thread(run_tool, "get_camera_snapshot", {"camera_name": text}, user_id)
             else:
                 out = "Unsupported tool input."
-        await send_reply_with_actions(update, text, out)
+        snapshot_path = _snapshot_queue.pop(user_id, None)
+        if snapshot_path:
+            await update.message.reply_photo(photo=open(snapshot_path, "rb"), caption=out)
+            os.unlink(snapshot_path)
+        else:
+            await send_reply_with_actions(update, text, out)
         return
 
     if context.user_data.get("awaiting_voice_edit"):
@@ -1021,6 +1058,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = await asyncio.to_thread(get_camera_status)
         await query.message.reply_text(text)
         return
+    if action == "tool_camera_snapshot":
+        context.user_data["awaiting_tool"] = "tool_camera_snapshot"
+        await query.message.reply_text("Send the camera name (e.g. `Front of Garage`).")
+        return
     if action == "tool_doorbell_snapshot":
         async with processing_indicator(context.bot, query.message.chat_id):
             text = await asyncio.to_thread(run_tool, "get_doorbell_snapshot", {}, user_id)
@@ -1289,6 +1330,7 @@ def format_all_tools_text() -> str:
         "- Nest Devices\n"
         "- Thermostat Status\n"
         "- Camera Status\n"
+        "- Camera Snapshot\n"
         "- Doorbell Snapshot\n\n"
         "Utilities\n"
         "- Time\n"
