@@ -263,6 +263,43 @@ def set_thermostat_temperature(temperature: float, unit: str = "celsius") -> str
     return f"Thermostat set to {round(temperature, 1)}°C."
 
 
+def set_thermostat_mode(mode: str) -> str:
+    data = nest_get("devices")
+    devices = data.get("devices", [])
+    thermostats = [d for d in devices if "THERMOSTAT" in d.get("type", "")]
+    if not thermostats:
+        return "No Nest thermostat found."
+
+    thermostat = thermostats[0]
+    device_id = thermostat["name"].split("/")[-1]
+    traits = thermostat.get("traits", {})
+    mode_trait = traits.get("sdm.devices.traits.ThermostatMode", {})
+
+    normalized = (mode or "").strip().upper().replace("-", "").replace("_", "")
+    mode_map = {
+        "OFF": "OFF",
+        "HEAT": "HEAT",
+        "COOL": "COOL",
+        "HEATCOOL": "HEATCOOL",
+        "AUTO": "HEATCOOL",
+    }
+    target_mode = mode_map.get(normalized)
+    if not target_mode:
+        return "Invalid thermostat mode. Use one of: OFF, HEAT, COOL, HEATCOOL."
+
+    available_modes = mode_trait.get("availableModes", [])
+    if available_modes and target_mode not in available_modes:
+        supported = ", ".join(available_modes)
+        return f"This thermostat does not support {target_mode}. Available modes: {supported}"
+
+    body = {
+        "command": "sdm.devices.commands.ThermostatMode.SetMode",
+        "params": {"mode": target_mode},
+    }
+    nest_post(f"devices/{device_id}:executeCommand", body)
+    return f"Thermostat mode set to {target_mode}."
+
+
 def _fix_nest_sdp(sdp: str) -> str:
     """Fix non-standard ICE candidate lines in Nest's answer SDP.
 

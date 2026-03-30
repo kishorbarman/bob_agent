@@ -9,7 +9,7 @@ For complete operational instructions, see [`INSTRUCTION_MANUAL.md`](INSTRUCTION
 | Tool | What Bob can do |
 |------|----------------|
 | 💬 Chat | General Q&A, reasoning, writing — powered by Gemini |
-| 🎛 UX actions | Inline quick actions: search web, elaborate, summarize, translate, retry |
+| 🎛 UX style | Clean chat-first UX with `/tools`, `/style`, `/model`, `/prefs` |
 | 🧭 Command menu | `/help`, `/tools`, `/prefs` guided flows |
 | 🕐 Time | Current date and time in any timezone |
 | 🌤 Weather | Current conditions + 3-day forecast for any city |

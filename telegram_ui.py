@@ -18,23 +18,6 @@ def parse_callback_data(data: str) -> dict[str, str]:
     return result
 
 
-def quick_actions_keyboard(ctx: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Search Web", callback_data=make_callback("search_web", ctx)),
-                InlineKeyboardButton("Elaborate", callback_data=make_callback("elaborate", ctx)),
-                InlineKeyboardButton("Summarize", callback_data=make_callback("summarize", ctx)),
-            ],
-            [
-                InlineKeyboardButton("Translate", callback_data=make_callback("translate", ctx)),
-                InlineKeyboardButton("Retry", callback_data=make_callback("retry", ctx)),
-                InlineKeyboardButton("Reset", callback_data=make_callback("reset", ctx)),
-            ],
-        ]
-    )
-
-
 def tools_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [

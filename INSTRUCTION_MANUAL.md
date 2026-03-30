@@ -2,7 +2,7 @@
 
 ## 1) Overview
 
-Bob is an always-on Telegram assistant powered by Gemini, with optional Google integrations (Calendar, Gmail, Nest), plus Telegram UX upgrades (quick actions, guided menus, voice notes, and file/image understanding).
+Bob is an always-on Telegram assistant powered by Gemini, with optional Google integrations (Calendar, Gmail, Nest), plus Telegram UX upgrades (guided menus, voice notes, and file/image understanding).
 
 This manual explains:
 - How to install and run Bob
@@ -58,7 +58,6 @@ GEMINI_API_KEY=...
 
 ```env
 NEST_PROJECT_ID=...
-UX_PHASE1_ENABLED=true
 UX_PHASE2_ENABLED=true
 UX_PHASE3_ENABLED=true
 UX_PHASE4_ENABLED=true
@@ -107,15 +106,10 @@ python3 bot.py
 - `/model`: Select model (`Gemini 3.1 Flash-Lite Preview` or `Gemini 3.1 Pro Preview`)
 - `/reset`: Clears in-memory conversation for current user
 
-### Quick Actions on assistant replies
+### Chat-first interaction style
 
-Each assistant response can include action buttons:
-- `Search Web`: Pulls web snippets and synthesizes a current answer
-- `Elaborate`: Expands previous answer with more depth and context
-- `Summarize`: Compresses previous answer into short bullets
-- `Translate`: Translates previous answer to user preference language
-- `Retry`: Re-runs answer generation with stronger web intent
-- `Reset`: Clears session memory
+Bob now replies in plain chat without inline per-message action buttons.
+For follow-up operations, ask directly in natural language (for example: "summarize that", "translate to Spanish", or "search the web for the latest").
 
 ### Preferences
 
@@ -171,7 +165,6 @@ SQLite database file: `bob.db`
 
 Tables:
 - `user_preferences`: per-user timezone/language/style
-- `message_contexts`: prior prompt/reply for quick actions
 - `callback_events`: duplicate callback suppression
 - `pending_transcriptions`: voice draft state
 - `artifacts`: latest file/image context for follow-up Q&A
@@ -179,7 +172,6 @@ Tables:
 ## 11) Feature Flags
 
 Flags read from env:
-- `UX_PHASE1_ENABLED`
 - `UX_PHASE2_ENABLED`
 - `UX_PHASE3_ENABLED`
 - `UX_PHASE4_ENABLED`
@@ -235,17 +227,17 @@ Current test coverage includes:
 - Ensure mime type is image/pdf/text
 - For scanned image-only PDFs, text extraction may be limited
 
-### Quick action says no context
+### A follow-up request did not use prior context
 
-- Action must be pressed on a response that has stored context
-- If context was lost, send the query again and use action on fresh response
+- Ask directly with explicit reference (for example: "summarize your previous answer")
+- If needed, resend the original prompt to rebuild context
 
 ## 14) Operations Checklist (Always-On)
 
 Daily:
 - Confirm process is running (`tmux attach -t bob`)
 - Check logs for repeated handler exceptions
-- Run quick smoke tests (`/help`, `/tools`, one quick action)
+- Run quick smoke tests (`/help`, `/tools`, and one natural-language follow-up)
 
 Weekly:
 - Test Google tool paths (calendar + email)

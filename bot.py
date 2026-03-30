@@ -9,6 +9,7 @@ import tempfile
 from contextlib import asynccontextmanager, suppress
 from functools import wraps
 from pathlib import Path
+from typing import Optional
 
 import httpx
 import wikipedia
@@ -38,6 +39,7 @@ from google_services import (
     search_calendar_events,
     search_emails,
     set_thermostat_temperature,
+    set_thermostat_mode,
 )
 from preferences import (
     get_user_preferences,
@@ -51,12 +53,10 @@ from storage import (
     clear_pending_transcription,
     get_latest_artifact,
     list_known_user_ids,
-    get_message_context,
     get_pending_transcription,
     init_storage,
     is_duplicate_callback,
     save_artifact,
-    save_message_context,
     save_pending_transcription,
 )
 from telegram_ui import (
@@ -64,7 +64,6 @@ from telegram_ui import (
     model_keyboard,
     parse_callback_data,
     prefs_keyboard,
-    quick_actions_keyboard,
     render_card,
     style_keyboard,
     tools_category_keyboard,
@@ -91,7 +90,8 @@ _snapshot_queue: dict[int, str] = {}
 SYSTEM_PROMPT = (
     "You are a helpful personal assistant called Bob. Be concise and direct. "
     "Use tools whenever they will give a better answer than your training data alone. "
-    "If the user asks to see a camera view, call the camera snapshot tool instead of apologizing."
+    "If the user asks to see a camera view, call the camera snapshot tool instead of apologizing. "
+    "If the user asks to turn the thermostat off or change HVAC mode, call thermostat mode tools."
 )
 
 
@@ -241,6 +241,17 @@ TOOLS = [
             "required": ["temperature"],
         },
     },
+    {
+        "name": "set_thermostat_mode",
+        "description": "Set Nest thermostat mode. Supports OFF, HEAT, COOL, HEATCOOL.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "description": "Target thermostat mode (OFF, HEAT, COOL, HEATCOOL)"},
+            },
+            "required": ["mode"],
+        },
+    },
     {"name": "get_camera_status", "description": "Get Nest camera status.", "input_schema": {"type": "object", "properties": {}, "required": []}},
     {
         "name": "get_camera_snapshot",
@@ -328,7 +339,6 @@ def env_flag(name: str, default: bool) -> bool:
     return raw in {"1", "true", "yes", "y", "on"}
 
 
-UX_PHASE1_ENABLED = env_flag("UX_PHASE1_ENABLED", True)
 UX_PHASE2_ENABLED = env_flag("UX_PHASE2_ENABLED", True)
 UX_PHASE3_ENABLED = env_flag("UX_PHASE3_ENABLED", True)
 UX_PHASE4_ENABLED = env_flag("UX_PHASE4_ENABLED", True)
@@ -410,7 +420,7 @@ def style_reply(text: str, style: str) -> str:
         lines = [line for line in text.splitlines() if line.strip()]
         return "\n".join(lines[:4])[:600]
     if style == "detailed" and len(text) < 120:
-        return f"{text}\n\nNeed more detail? Tap Retry and ask for a deeper walkthrough."
+        return f"{text}\n\nNeed more detail? Ask for a deeper walkthrough."
     return text
 
 
@@ -602,6 +612,8 @@ def run_tool(name: str, tool_input: dict, user_id: int = 0) -> str:
         return get_thermostat_status()
     if name == "set_thermostat_temperature":
         return set_thermostat_temperature(tool_input["temperature"], tool_input.get("unit", "celsius"))
+    if name == "set_thermostat_mode":
+        return set_thermostat_mode(tool_input["mode"])
     if name == "get_camera_status":
         return get_camera_status()
     if name == "get_camera_snapshot":
@@ -692,6 +704,30 @@ def summarize_for_preview(text: str, max_len: int = 700) -> str:
     return text if len(text) <= max_len else text[:max_len] + "..."
 
 
+def detect_thermostat_mode_request(text: str) -> Optional[str]:
+    msg = (text or "").strip().lower()
+    if not msg:
+        return None
+
+    thermostat_context = any(
+        token in msg for token in ("thermostat", "hvac", "heater", "air conditioner", "ac mode")
+    )
+    if not thermostat_context:
+        return None
+
+    if any(phrase in msg for phrase in ("turn off", "set to off", "mode off", "switch off")):
+        return "OFF"
+    if "heatcool" in msg or "heat cool" in msg or "auto" in msg:
+        return "HEATCOOL"
+    if "cool" in msg or "ac" in msg:
+        return "COOL"
+    if "heat" in msg:
+        return "HEAT"
+    if re.search(r"\boff\b", msg):
+        return "OFF"
+    return None
+
+
 def analyze_image(path: Path, model: str = DEFAULT_MODEL) -> str:
     mime_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
     image_bytes = path.read_bytes()
@@ -725,13 +761,8 @@ def extract_pdf_text(path: Path) -> str:
     return "\n".join(pages).strip()
 
 
-async def send_reply_with_actions(update: Update, user_prompt: str, reply_text: str):
-    if UX_PHASE1_ENABLED:
-        sent = await update.message.reply_text(reply_text)
-        save_message_context(update.effective_user.id, sent.message_id, user_prompt, reply_text)
-        await sent.edit_reply_markup(reply_markup=quick_actions_keyboard(str(sent.message_id)))
-    else:
-        await update.message.reply_text(reply_text)
+async def send_reply_with_actions(update: Update, _user_prompt: str, reply_text: str):
+    await update.message.reply_text(reply_text)
 
 
 @handler_guard
@@ -800,6 +831,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Question: {text}",
             )
         await send_reply_with_actions(update, text, answer)
+        return
+
+    thermostat_mode = detect_thermostat_mode_request(text)
+    if thermostat_mode:
+        async with processing_indicator(context.bot, chat_id):
+            out = await asyncio.to_thread(run_tool, "set_thermostat_mode", {"mode": thermostat_mode}, user_id)
+        await send_reply_with_actions(update, text, out)
         return
 
     async with processing_indicator(context.bot, chat_id):
@@ -1099,10 +1137,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_photo(photo=open(snapshot_path, "rb"), caption=reply)
             os.unlink(snapshot_path)
             return
-        sent = await query.message.reply_text(reply)
-        save_message_context(user_id, sent.message_id, text, reply)
-        if UX_PHASE1_ENABLED:
-            await sent.edit_reply_markup(reply_markup=quick_actions_keyboard(str(sent.message_id)))
+        await query.message.reply_text(reply)
         return
 
     if action in {"artifact_summarize", "artifact_actions", "artifact_ask"}:
@@ -1134,79 +1169,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 model,
             )
         await query.message.reply_text(out)
-        return
-
-    if action in {"elaborate", "summarize", "translate", "retry", "search_web"}:
-        ctx = get_message_context(user_id, message_id)
-        if not ctx:
-            await query.message.reply_text("I could not find context for this action. Please ask again.")
-            return
-
-        source_text = ctx["reply_text"]
-        original_prompt = ctx["original_prompt"]
-
-        if action == "elaborate":
-            async with processing_indicator(context.bot, query.message.chat_id):
-                model = get_user_preferences(user_id).selected_model
-                out = await asyncio.to_thread(
-                    generate_short_model_response,
-                    "Elaborate on this answer with more depth, context, and detail while staying clear.",
-                    source_text,
-                    model,
-                )
-        elif action == "summarize":
-            async with processing_indicator(context.bot, query.message.chat_id):
-                model = get_user_preferences(user_id).selected_model
-                out = await asyncio.to_thread(
-                    generate_short_model_response,
-                    "Summarize this in 3 to 5 bullets.",
-                    source_text,
-                    model,
-                )
-        elif action == "translate":
-            prefs = get_user_preferences(user_id)
-            async with processing_indicator(context.bot, query.message.chat_id):
-                out = await asyncio.to_thread(
-                    generate_short_model_response,
-                    f"Translate this to {prefs.language}. Keep formatting compact.",
-                    source_text,
-                    prefs.selected_model,
-                )
-        elif action == "retry":
-            async with processing_indicator(context.bot, query.message.chat_id):
-                out, snapshot_path = await asyncio.to_thread(generate_agent_response, user_id, original_prompt, True)
-            if snapshot_path:
-                await query.message.reply_photo(photo=open(snapshot_path, "rb"), caption=out)
-                os.unlink(snapshot_path)
-                return
-        else:
-            async with processing_indicator(context.bot, query.message.chat_id):
-                web_results = await asyncio.to_thread(search_web, original_prompt, 5)
-            has_links = bool(re.search(r"https?://", web_results))
-            no_results = (
-                not web_results.strip()
-                or "No results found." in web_results
-                or not has_links
-            )
-            if no_results:
-                out = (
-                    "I couldn't find web snippets for that query right now. "
-                    "Try rephrasing with more specific keywords, or tap Retry."
-                )
-            else:
-                async with processing_indicator(context.bot, query.message.chat_id):
-                    model = get_user_preferences(user_id).selected_model
-                    out = await asyncio.to_thread(
-                        generate_short_model_response,
-                        "Create a concise answer from these web snippets and include source URLs.",
-                        web_results,
-                        model,
-                    )
-
-        sent = await query.message.reply_text(out)
-        save_message_context(user_id, sent.message_id, original_prompt, out)
-        if UX_PHASE1_ENABLED:
-            await sent.edit_reply_markup(reply_markup=quick_actions_keyboard(str(sent.message_id)))
         return
 
     await query.message.reply_text("Action not recognized.")
