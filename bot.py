@@ -105,14 +105,37 @@ async def _chat_action_pulse(bot, chat_id: int, action: str = ChatAction.TYPING)
 
 
 @asynccontextmanager
-async def processing_indicator(bot, chat_id: int, action: str = ChatAction.TYPING):
+async def processing_indicator(
+    bot,
+    chat_id: int,
+    action: str = ChatAction.TYPING,
+    status_text: str = "Bob is working on it...",
+):
     task = asyncio.create_task(_chat_action_pulse(bot, chat_id, action))
+    status_holder = {"message": None}
+
+    async def _send_delayed_status():
+        await asyncio.sleep(1.0)
+        try:
+            status_holder["message"] = await bot.send_message(chat_id=chat_id, text=status_text)
+        except Exception:
+            logger.debug("Failed to send status message", exc_info=True)
+
+    status_task = asyncio.create_task(_send_delayed_status()) if status_text else None
     try:
         yield
     finally:
+        if status_task:
+            status_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await status_task
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
+        status_message = status_holder.get("message")
+        if status_message:
+            with suppress(Exception):
+                await bot.delete_message(chat_id=chat_id, message_id=status_message.message_id)
 
 
 def gemini_generate_with_retry(model: str, contents, config, retries: int = 3):
@@ -774,7 +797,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending_tool = context.user_data.get("awaiting_tool")
     if pending_tool:
         context.user_data.pop("awaiting_tool", None)
-        async with processing_indicator(context.bot, chat_id):
+        pending_status_map = {
+            "tool_weather": "Bob is checking the weather...",
+            "tool_news": "Bob is gathering the latest news...",
+            "tool_web_search": "Bob is searching the web...",
+            "tool_wikipedia": "Bob is reading Wikipedia...",
+            "tool_calculate": "Bob is calculating that...",
+            "tool_country": "Bob is looking up country info...",
+            "tool_define": "Bob is checking the dictionary...",
+            "tool_calendar_search": "Bob is searching your calendar...",
+            "tool_email_search": "Bob is searching your email...",
+            "tool_camera_snapshot": "Bob is checking the camera feed...",
+        }
+        pending_status = pending_status_map.get(pending_tool, "Bob is working on it...")
+        async with processing_indicator(context.bot, chat_id, status_text=pending_status):
             if pending_tool == "tool_weather":
                 raw = await asyncio.to_thread(fetch_weather, text)
                 out = render_card("weather", raw) if UX_PHASE2_ENABLED else raw
@@ -824,7 +860,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not artifact:
             await update.message.reply_text("No recent file context found.")
             return
-        async with processing_indicator(context.bot, chat_id):
+        async with processing_indicator(context.bot, chat_id, status_text="Bob is reading your file..."):
             answer = await asyncio.to_thread(
                 generate_short_model_response,
                 f"Answer the user question using only this artifact context:\n\n{artifact['content_text']}",
@@ -835,12 +871,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     thermostat_mode = detect_thermostat_mode_request(text)
     if thermostat_mode:
-        async with processing_indicator(context.bot, chat_id):
+        async with processing_indicator(context.bot, chat_id, status_text="Bob is updating the thermostat..."):
             out = await asyncio.to_thread(run_tool, "set_thermostat_mode", {"mode": thermostat_mode}, user_id)
         await send_reply_with_actions(update, text, out)
         return
 
-    async with processing_indicator(context.bot, chat_id):
+    async with processing_indicator(context.bot, chat_id, status_text="Bob is thinking..."):
         reply, snapshot_path = await asyncio.to_thread(generate_agent_response, user_id, text)
 
     if snapshot_path:
@@ -884,7 +920,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await tg_file.download_to_drive(custom_path=str(temp_path))
-        async with processing_indicator(context.bot, update.effective_chat.id):
+        async with processing_indicator(context.bot, update.effective_chat.id, status_text="Bob is analyzing the image..."):
             user_model = get_user_preferences(update.effective_user.id).selected_model
             summary = await asyncio.to_thread(analyze_image, temp_path, user_model)
     finally:
@@ -918,7 +954,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await tg_file.download_to_drive(custom_path=str(temp_path))
 
-        async with processing_indicator(context.bot, update.effective_chat.id):
+        async with processing_indicator(context.bot, update.effective_chat.id, status_text="Bob is reading the document..."):
             user_model = get_user_preferences(update.effective_user.id).selected_model
             if doc_type == "image":
                 content = await asyncio.to_thread(analyze_image, temp_path, user_model)
@@ -1064,7 +1100,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Send a word to define.")
         return
     if action == "tool_calendar":
-        async with processing_indicator(context.bot, query.message.chat_id):
+        async with processing_indicator(context.bot, query.message.chat_id, status_text="Bob is checking your calendar..."):
             text = await asyncio.to_thread(get_upcoming_events, 8)
         await query.message.reply_text(render_card("calendar", text) if UX_PHASE2_ENABLED else text)
         return
@@ -1073,7 +1109,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Send a calendar search term.")
         return
     if action == "tool_email":
-        async with processing_indicator(context.bot, query.message.chat_id):
+        async with processing_indicator(context.bot, query.message.chat_id, status_text="Bob is checking your inbox..."):
             text = await asyncio.to_thread(get_recent_emails, 5)
         await query.message.reply_text(render_card("email", text) if UX_PHASE2_ENABLED else text)
         return
@@ -1082,17 +1118,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Send a Gmail search query (e.g. `from:alice invoice`).")
         return
     if action == "tool_nest_devices":
-        async with processing_indicator(context.bot, query.message.chat_id):
+        async with processing_indicator(context.bot, query.message.chat_id, status_text="Bob is checking your Nest devices..."):
             text = await asyncio.to_thread(get_nest_devices)
         await query.message.reply_text(text)
         return
     if action == "tool_nest":
-        async with processing_indicator(context.bot, query.message.chat_id):
+        async with processing_indicator(context.bot, query.message.chat_id, status_text="Bob is checking the thermostat..."):
             text = await asyncio.to_thread(get_thermostat_status)
         await query.message.reply_text(text)
         return
     if action == "tool_camera_status":
-        async with processing_indicator(context.bot, query.message.chat_id):
+        async with processing_indicator(context.bot, query.message.chat_id, status_text="Bob is checking camera status..."):
             text = await asyncio.to_thread(get_camera_status)
         await query.message.reply_text(text)
         return
@@ -1101,7 +1137,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Send the camera name (e.g. `Front of Garage`).")
         return
     if action == "tool_doorbell_snapshot":
-        async with processing_indicator(context.bot, query.message.chat_id):
+        async with processing_indicator(context.bot, query.message.chat_id, status_text="Bob is checking the doorbell camera..."):
             text = await asyncio.to_thread(run_tool, "get_doorbell_snapshot", {}, user_id)
         snapshot_path = _snapshot_queue.pop(user_id, None)
         if snapshot_path:
@@ -1113,7 +1149,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "tool_media_help":
         await query.message.reply_text(
             "Send a photo, image file, PDF, or text file and I will analyze it. "
-            "Then use follow-up buttons for summarize/action-items/Q&A."
+            "Then ask follow-up questions in chat for summaries, action items, or Q&A."
         )
         return
 
@@ -1131,7 +1167,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not text:
             await query.message.reply_text("No pending transcription found.")
             return
-        async with processing_indicator(context.bot, query.message.chat_id):
+        async with processing_indicator(context.bot, query.message.chat_id, status_text="Bob is thinking..."):
             reply, snapshot_path = await asyncio.to_thread(generate_agent_response, user_id, text)
         if snapshot_path:
             await query.message.reply_photo(photo=open(snapshot_path, "rb"), caption=reply)
@@ -1150,7 +1186,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Ask your question about the last uploaded file.")
             return
         if action == "artifact_summarize":
-            async with processing_indicator(context.bot, query.message.chat_id):
+            async with processing_indicator(context.bot, query.message.chat_id, status_text="Bob is summarizing your file..."):
                 model = get_user_preferences(user_id).selected_model
                 out = await asyncio.to_thread(
                     generate_short_model_response,
@@ -1160,7 +1196,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             await query.message.reply_text(out)
             return
-        async with processing_indicator(context.bot, query.message.chat_id):
+        async with processing_indicator(context.bot, query.message.chat_id, status_text="Bob is extracting action items..."):
             model = get_user_preferences(user_id).selected_model
             out = await asyncio.to_thread(
                 generate_short_model_response,
