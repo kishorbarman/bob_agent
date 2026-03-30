@@ -1,0 +1,20 @@
+[Unit]
+Description=Bob Telegram Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/Users/kishorbarman/projects/bob_agent
+EnvironmentFile=/Users/kishorbarman/projects/bob_agent/.env
+ExecStart=/usr/bin/python3 /Users/kishorbarman/projects/bob_agent/bot.py
+ExecStartPre=/usr/bin/python3 /Users/kishorbarman/projects/bob_agent/bot_healthcheck.py
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+StandardOutput=append:/Users/kishorbarman/projects/bob_agent/logs/bob-agent.log
+StandardError=append:/Users/kishorbarman/projects/bob_agent/logs/bob-agent.log
+
+[Install]
+WantedBy=multi-user.target

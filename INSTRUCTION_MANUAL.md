@@ -58,6 +58,8 @@ GEMINI_API_KEY=...
 
 ```env
 NEST_PROJECT_ID=...
+ADMIN_CHAT_ID=...
+ALERT_WEBHOOK_URL=...
 UX_PHASE2_ENABLED=true
 UX_PHASE3_ENABLED=true
 UX_PHASE4_ENABLED=true
@@ -94,6 +96,27 @@ python3 bot.py
 # reattach: tmux attach -t bob
 ```
 
+### Health check command
+
+Run this before starting or in periodic monitoring:
+
+```bash
+python3 bot_healthcheck.py
+```
+
+It validates:
+- SQLite DB access
+- Gemini client readiness (and optional API check)
+- `token.json` presence/freshness hint for Google integrations
+
+### Graceful shutdown
+
+Use graceful stop paths so Bob can send offline notices and clean up correctly:
+- Foreground: `Ctrl+C`
+- `tmux`: attach, then `Ctrl+C` in the bot pane
+- systemd: `systemctl stop bob-agent`
+- Docker: `docker stop <container>`
+
 ## 7) Telegram Commands and UX
 
 ### Commands
@@ -105,6 +128,10 @@ python3 bot.py
 - `/style`: Opens readable style-only selector (`short`, `normal`, `detailed`)
 - `/model`: Select model (`Gemini 3.1 Flash-Lite Preview` or `Gemini 3.1 Pro Preview`)
 - `/reset`: Clears in-memory conversation for current user
+- `/brief`: Configure daily brief mode (`on`, `off`, `time HH:MM`)
+- `/quiet`: Configure quiet hours (`HH:MM-HH:MM` or `off`)
+- `/watchers`: Manage proactive watchers (`list`, `add`, `pause`, `resume`, `remove`)
+- `/proactive`: Manage proactive modes (`on|off`, `nudges on|off`, `digest instant|batched`, status)
 
 ### Chat-first interaction style
 
@@ -119,6 +146,38 @@ Preference menu updates and persists:
 - Timezone (`America/Los_Angeles`, `America/New_York`, `UTC`)
 
 Preferences are saved in SQLite and survive bot restarts.
+
+### Proactive modes
+
+Bob supports proactive delivery modes in addition to normal chat:
+
+- Daily brief mode (`/brief`):
+  - `/brief on`
+  - `/brief off`
+  - `/brief time 08:30`
+- Quiet-hours mode (`/quiet`):
+  - `/quiet 22:00-07:00`
+  - `/quiet off`
+- Watcher mode (`/watchers`):
+  - `/watchers list`
+  - `/watchers add news ai agents`
+  - `/watchers add price BTC above 120000`
+  - `/watchers pause 1`
+  - `/watchers resume 1`
+  - `/watchers remove 1`
+- Proactive control mode (`/proactive`):
+  - `/proactive on`
+  - `/proactive off`
+  - `/proactive nudges on`
+  - `/proactive nudges off`
+  - `/proactive digest instant`
+  - `/proactive digest batched`
+  - `/proactive` (status)
+
+Mode behavior:
+- `quiet` defers non-critical proactive notifications during configured hours.
+- `digest batched` groups bursty proactive notifications.
+- Watchers use dedupe/idempotency to avoid repeated alerts for the same event.
 
 ## 8) Voice Notes Flow (Phase 3)
 
@@ -168,6 +227,11 @@ Tables:
 - `callback_events`: duplicate callback suppression
 - `pending_transcriptions`: voice draft state
 - `artifacts`: latest file/image context for follow-up Q&A
+- `conversation_messages`: persisted conversation history for restart continuity
+- `proactive_jobs`: scheduled proactive jobs per user
+- `watchers`: proactive watcher definitions
+- `proactive_events`: dedupe/idempotency ledger for proactive sends
+- `delivery_log`: proactive delivery outcomes
 
 ## 11) Feature Flags
 
@@ -175,6 +239,13 @@ Flags read from env:
 - `UX_PHASE2_ENABLED`
 - `UX_PHASE3_ENABLED`
 - `UX_PHASE4_ENABLED`
+- `OFFLINE_BROADCAST_ENABLED`
+- `ONLINE_BROADCAST_ENABLED`
+- `PROACTIVE_ENABLED`
+- `PROACTIVE_MORNING_BRIEF_ENABLED`
+- `PROACTIVE_CALENDAR_NUDGES_ENABLED`
+- `PROACTIVE_WATCHERS_ENABLED`
+- `PROACTIVE_DIGEST_ENABLED`
 
 Turn a feature off by setting its value to `false`.
 
@@ -238,11 +309,46 @@ Daily:
 - Confirm process is running (`tmux attach -t bob`)
 - Check logs for repeated handler exceptions
 - Run quick smoke tests (`/help`, `/tools`, and one natural-language follow-up)
+- Run `python3 bot_healthcheck.py`
 
 Weekly:
 - Test Google tool paths (calendar + email)
 - Validate voice and file flow still functioning
 - Rotate/revalidate API credentials if needed
+
+### systemd operation (optional)
+
+Service template: `ops/systemd/bob-agent.service`
+
+```bash
+mkdir -p logs
+sudo cp ops/systemd/bob-agent.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable bob-agent
+sudo systemctl start bob-agent
+sudo systemctl status bob-agent
+```
+
+Service logs are written to:
+- `logs/bob-agent.log`
+
+### Docker operation (optional)
+
+Dockerfile: `ops/docker/Dockerfile`
+
+```bash
+docker build -f ops/docker/Dockerfile -t bob-agent .
+docker run --env-file .env --name bob-agent --restart unless-stopped bob-agent
+docker logs -f bob-agent
+```
+
+### Incident checklist
+
+1. Run `python3 bot_healthcheck.py` and capture output.
+2. Review latest `logs/bob-agent.log` for `handler_exception`, `tool_result`, and `startup_shutdown_error` events.
+3. Confirm required env vars (`TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY`) are present.
+4. If Google tools fail, verify `credentials.json` and `token.json`.
+5. Restart gracefully (`systemctl restart bob-agent` or `docker restart bob-agent`).
 
 ## 15) Security and Safety Recommendations
 
@@ -262,7 +368,7 @@ To add a new tool:
 
 ## 17) Known Limitations
 
-- Conversation history is still in-memory and not persisted in DB
+- Conversation persistence is SQLite-backed; long-term retention tuning is still basic
 - Polling mode is used instead of webhooks
 - Some advanced media features rely on external model APIs
 - Voice transcription is currently disabled in the current configuration
@@ -270,8 +376,8 @@ To add a new tool:
 
 ## 18) Recommended Next Hardening Steps
 
-1. Persist conversation history in SQLite/Postgres
-2. Add process supervisor (`systemd` or Docker healthcheck)
-3. Add structured JSON logging + error alerting
+1. Expand health checks with dependency latency thresholds
+2. Add process supervisor auto-healing policies per environment
+3. Tune alert routing and escalation policy
 4. Add user allowlist and per-action permissions
 5. Add retry/backoff wrappers for all network calls

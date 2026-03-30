@@ -21,6 +21,7 @@ For complete operational instructions, see [`INSTRUCTION_MANUAL.md`](INSTRUCTION
 | 📚 Dictionary | Definitions, phonetics, examples |
 | 📅 Google Calendar | Upcoming events, search by keyword |
 | 📧 Gmail | Recent inbox emails, search by query |
+| ⏰ Proactive modes | Daily briefs, quiet hours, watchers, proactive nudges/digest |
 | 🎤 Voice | Voice note handling with fallback messaging (transcription currently disabled) |
 | 🖼 Files & images | Image understanding, PDF/text summarization, file follow-up Q&A |
 
@@ -93,6 +94,10 @@ tmux attach -t bob           # reattach later
 | `/style` | Set response style with readable options |
 | `/model` | Choose model: Gemini 3.1 Flash-Lite Preview or Gemini 3.1 Pro Preview |
 | `/reset` | Clear conversation history |
+| `/brief` | Enable/disable/configure daily brief mode |
+| `/quiet` | Set quiet-hours window for proactive notifications |
+| `/watchers` | Manage proactive watchers (news/price) |
+| `/proactive` | Control proactive system, nudges, and digest mode |
 
 ## Project Structure
 
@@ -142,18 +147,20 @@ bob_agent/
 ### State, Auth, and External Dependencies
 
 - Bot/API credentials are loaded from environment variables (`TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY`, `NEST_PROJECT_ID`).
+- Optional ops alerting uses `ADMIN_CHAT_ID` (Telegram) and/or `ALERT_WEBHOOK_URL` (Slack).
 - Google OAuth uses:
   - `credentials.json` (OAuth client credentials)
   - `token.json` (persisted user access/refresh token)
-- Current conversation memory is in-process only and is reset when the bot restarts.
+- Conversation history is persisted in SQLite and rehydrated on restart.
 
 ### Current Operational Notes
 
 - The bot is currently single-process and polling-based (not webhook-based).
-- It has good functional breadth, but limited production hardening by default:
-  - in-memory chat history
-  - no built-in process supervisor
-  - minimal explicit retry/backoff strategy across external API calls
+- It now includes reliability and operations hardening:
+  - persisted conversation history
+  - retry/timeout/circuit behavior for external calls
+  - structured ops logs + alerting hooks
+  - optional proactive scheduler modes
 
 ## Adding New Tools
 

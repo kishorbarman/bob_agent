@@ -2,10 +2,10 @@ import asyncio
 import logging
 import math
 import os
-import random
-import time
 import re
 import tempfile
+import time
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager, suppress
 from functools import wraps
 from pathlib import Path
@@ -48,16 +48,38 @@ from preferences import (
     set_response_style,
     set_timezone,
 )
+from proactive import ProactiveScheduler
 from media_utils import detect_document_type
+from ops_logging import (
+    dispatch_alert,
+    log_event,
+    make_trace_id,
+    record_failure,
+    reset_failure,
+)
+from reliability import run_with_resilience
 from storage import (
+    append_conversation_message,
+    clear_conversation,
     clear_pending_transcription,
     get_latest_artifact,
     list_known_user_ids,
+    load_recent_conversation,
     get_pending_transcription,
+    get_proactive_job,
+    get_proactive_settings,
     init_storage,
     is_duplicate_callback,
+    list_watchers,
     save_artifact,
     save_pending_transcription,
+    set_proactive_job_enabled,
+    set_watcher_enabled,
+    delete_watcher,
+    upsert_proactive_job,
+    upsert_proactive_setting,
+    upsert_watcher,
+    trim_conversation,
 )
 from telegram_ui import (
     artifact_actions_keyboard,
@@ -73,6 +95,9 @@ from telegram_ui import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+ADMIN_CHAT_ID_RAW = os.getenv("ADMIN_CHAT_ID", "").strip()
+ADMIN_CHAT_ID = int(ADMIN_CHAT_ID_RAW) if ADMIN_CHAT_ID_RAW.isdigit() else None
+ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").strip()
 
 gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 DEFAULT_MODEL = "models/gemini-3.1-flash-lite-preview"
@@ -139,24 +164,15 @@ async def processing_indicator(
 
 
 def gemini_generate_with_retry(model: str, contents, config, retries: int = 3):
-    base_delay = 1.0
-    for attempt in range(1, retries + 1):
-        try:
-            return gemini_client.models.generate_content(
-                model=model, contents=contents, config=config
-            )
-        except Exception as exc:
-            if attempt == retries:
-                raise
-            delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.4)
-            logger.warning(
-                "Gemini error (attempt %s/%s): %s. Retrying in %.2fs",
-                attempt,
-                retries,
-                exc,
-                delay,
-            )
-            time.sleep(delay)
+    return run_with_resilience(
+        lambda: gemini_client.models.generate_content(
+            model=model, contents=contents, config=config
+        ),
+        operation="gemini_generate_content",
+        retries=retries,
+        timeout_s=40,
+        breaker_key="gemini",
+    )
 
 TOOLS = [
     {
@@ -367,15 +383,63 @@ UX_PHASE3_ENABLED = env_flag("UX_PHASE3_ENABLED", True)
 UX_PHASE4_ENABLED = env_flag("UX_PHASE4_ENABLED", True)
 OFFLINE_BROADCAST_ENABLED = env_flag("OFFLINE_BROADCAST_ENABLED", True)
 ONLINE_BROADCAST_ENABLED = env_flag("ONLINE_BROADCAST_ENABLED", True)
+PROACTIVE_MORNING_BRIEF_ENABLED = env_flag("PROACTIVE_MORNING_BRIEF_ENABLED", True)
+PROACTIVE_CALENDAR_NUDGES_ENABLED = env_flag("PROACTIVE_CALENDAR_NUDGES_ENABLED", True)
+PROACTIVE_WATCHERS_ENABLED = env_flag("PROACTIVE_WATCHERS_ENABLED", True)
+
+proactive_scheduler: Optional[ProactiveScheduler] = None
 
 
 def handler_guard(func):
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        trace_id = make_trace_id()
+        started_at = time.perf_counter()
+        user_id = update.effective_user.id if update and update.effective_user else None
+        log_event(
+            logger,
+            "handler_start",
+            trace_id=trace_id,
+            handler=func.__name__,
+            user_id=user_id,
+        )
         try:
-            return await func(update, context)
+            result = await func(update, context)
+            latency_ms = int((time.perf_counter() - started_at) * 1000)
+            reset_failure("handler:%s" % func.__name__)
+            log_event(
+                logger,
+                "handler_success",
+                trace_id=trace_id,
+                handler=func.__name__,
+                user_id=user_id,
+                latency_ms=latency_ms,
+                result="ok",
+            )
+            return result
         except Exception as exc:
             logger.exception("Handler failed", extra={"handler": func.__name__})
+            latency_ms = int((time.perf_counter() - started_at) * 1000)
+            count, should_alert = record_failure("handler:%s" % func.__name__)
+            log_event(
+                logger,
+                "handler_exception",
+                trace_id=trace_id,
+                handler=func.__name__,
+                user_id=user_id,
+                latency_ms=latency_ms,
+                result="error",
+                error=str(exc)[:300],
+                consecutive_failures=count,
+            )
+            if should_alert:
+                await dispatch_alert(
+                    logger,
+                    f"Bob alert: handler `{func.__name__}` failing repeatedly ({count} consecutive).",
+                    bot=context.bot if context else None,
+                    admin_chat_id=ADMIN_CHAT_ID,
+                    slack_webhook_url=ALERT_WEBHOOK_URL,
+                )
             if is_offline_error(exc):
                 message = (
                     "Bob is currently offline. Please try again in a minute."
@@ -461,27 +525,37 @@ def get_current_time(timezone: str = "") -> str:
 
 
 def fetch_weather(city: str) -> str:
-    geo = httpx.get(
-        "https://geocoding-api.open-meteo.com/v1/search",
-        params={"name": city, "count": 1},
-        timeout=12,
-    ).json()
+    geo = run_with_resilience(
+        lambda: httpx.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": city, "count": 1},
+            timeout=12,
+        ).json(),
+        operation="weather_geocode",
+        timeout_s=15,
+        breaker_key="weather_api",
+    )
     if not geo.get("results"):
         return f"Could not find location: {city}"
 
     result = geo["results"][0]
-    weather = httpx.get(
-        "https://api.open-meteo.com/v1/forecast",
-        params={
-            "latitude": result["latitude"],
-            "longitude": result["longitude"],
-            "current": "temperature_2m,apparent_temperature,wind_speed_10m",
-            "daily": "temperature_2m_max,temperature_2m_min",
-            "forecast_days": 3,
-            "timezone": "auto",
-        },
-        timeout=12,
-    ).json()
+    weather = run_with_resilience(
+        lambda: httpx.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": result["latitude"],
+                "longitude": result["longitude"],
+                "current": "temperature_2m,apparent_temperature,wind_speed_10m",
+                "daily": "temperature_2m_max,temperature_2m_min",
+                "forecast_days": 3,
+                "timezone": "auto",
+            },
+            timeout=12,
+        ).json(),
+        operation="weather_forecast",
+        timeout_s=15,
+        breaker_key="weather_api",
+    )
 
     current = weather["current"]
     daily = weather["daily"]
@@ -498,8 +572,12 @@ def fetch_weather(city: str) -> str:
 
 def search_web(query: str, max_results: int = 5) -> str:
     try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=max_results))
+        results = run_with_resilience(
+            lambda: _search_web_ddgs(query, max_results),
+            operation="web_search",
+            timeout_s=20,
+            breaker_key="web_search",
+        )
     except Exception as exc:
         logger.warning("Web search provider error for query=%r: %s", query, exc)
         return "Web search is temporarily unavailable."
@@ -510,8 +588,12 @@ def search_web(query: str, max_results: int = 5) -> str:
 
 def get_news(query: str, max_results: int = 5) -> str:
     try:
-        with DDGS() as ddgs:
-            results = list(ddgs.news(query, max_results=max_results))
+        results = run_with_resilience(
+            lambda: _search_news_ddgs(query, max_results),
+            operation="news_search",
+            timeout_s=20,
+            breaker_key="news_search",
+        )
     except Exception as exc:
         logger.warning("News search provider error for query=%r: %s", query, exc)
         return "News search is temporarily unavailable."
@@ -531,6 +613,16 @@ def wikipedia_search(query: str) -> str:
         return f"Ambiguous query. Did you mean: {', '.join(exc.options[:5])}?"
     except wikipedia.PageError:
         return f"No Wikipedia page found for '{query}'."
+
+
+def _search_web_ddgs(query: str, max_results: int) -> list[dict]:
+    with DDGS() as ddgs:
+        return list(ddgs.text(query, max_results=max_results))
+
+
+def _search_news_ddgs(query: str, max_results: int) -> list[dict]:
+    with DDGS() as ddgs:
+        return list(ddgs.news(query, max_results=max_results))
 
 
 def calculate(expression: str) -> str:
@@ -554,8 +646,13 @@ def calculate(expression: str) -> str:
 
 
 def get_country_info(country: str) -> str:
-    response = httpx.get(
-        f"https://restcountries.com/v3.1/name/{country}", params={"fullText": "false"}, timeout=10
+    response = run_with_resilience(
+        lambda: httpx.get(
+            f"https://restcountries.com/v3.1/name/{country}", params={"fullText": "false"}, timeout=10
+        ),
+        operation="country_info",
+        timeout_s=12,
+        breaker_key="restcountries_api",
     )
     if response.status_code != 200:
         return f"Country not found: {country}"
@@ -575,7 +672,12 @@ def get_country_info(country: str) -> str:
 
 
 def define_word(word: str) -> str:
-    response = httpx.get(f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}", timeout=10)
+    response = run_with_resilience(
+        lambda: httpx.get(f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}", timeout=10),
+        operation="dictionary_lookup",
+        timeout_s=12,
+        breaker_key="dictionary_api",
+    )
     if response.status_code != 200:
         return f"No definition found for '{word}'."
     data = response.json()[0]
@@ -612,46 +714,86 @@ def _capture_camera_snapshot(user_id: int, camera_name: str = "") -> str:
     return "Camera snapshot captured."
 
 
-def run_tool(name: str, tool_input: dict, user_id: int = 0) -> str:
-    if name == "get_current_time":
-        return get_current_time(tool_input.get("timezone", ""))
-    if name == "get_weather":
-        return fetch_weather(tool_input["city"])
-    if name == "web_search":
-        return search_web(tool_input["query"], tool_input.get("max_results", 5))
-    if name == "get_news":
-        return get_news(tool_input["query"], tool_input.get("max_results", 5))
-    if name == "wikipedia_search":
-        return wikipedia_search(tool_input["query"])
-    if name == "calculate":
-        return calculate(tool_input["expression"])
-    if name == "get_country_info":
-        return get_country_info(tool_input["country"])
-    if name == "define_word":
-        return define_word(tool_input["word"])
-    if name == "get_nest_devices":
-        return get_nest_devices()
-    if name == "get_thermostat_status":
-        return get_thermostat_status()
-    if name == "set_thermostat_temperature":
-        return set_thermostat_temperature(tool_input["temperature"], tool_input.get("unit", "celsius"))
-    if name == "set_thermostat_mode":
-        return set_thermostat_mode(tool_input["mode"])
-    if name == "get_camera_status":
-        return get_camera_status()
-    if name == "get_camera_snapshot":
-        return _capture_camera_snapshot(user_id, tool_input.get("camera_name", ""))
-    if name == "get_doorbell_snapshot":
-        return _capture_doorbell_snapshot(user_id)
-    if name == "get_upcoming_events":
-        return get_upcoming_events(tool_input.get("max_results", 10))
-    if name == "search_calendar_events":
-        return search_calendar_events(tool_input["query"], tool_input.get("max_results", 5))
-    if name == "get_recent_emails":
-        return get_recent_emails(tool_input.get("max_results", 5))
-    if name == "search_emails":
-        return search_emails(tool_input["query"], tool_input.get("max_results", 5))
-    return "Unknown tool"
+def run_tool(name: str, tool_input: dict, user_id: int = 0, trace_id: str = "") -> str:
+    tool_trace_id = trace_id or make_trace_id()
+    started_at = time.perf_counter()
+    log_event(
+        logger,
+        "tool_call",
+        trace_id=tool_trace_id,
+        user_id=user_id,
+        action=name,
+        result="start",
+    )
+    try:
+        if name == "get_current_time":
+            out = get_current_time(tool_input.get("timezone", ""))
+        elif name == "get_weather":
+            out = fetch_weather(tool_input["city"])
+        elif name == "web_search":
+            out = search_web(tool_input["query"], tool_input.get("max_results", 5))
+        elif name == "get_news":
+            out = get_news(tool_input["query"], tool_input.get("max_results", 5))
+        elif name == "wikipedia_search":
+            out = wikipedia_search(tool_input["query"])
+        elif name == "calculate":
+            out = calculate(tool_input["expression"])
+        elif name == "get_country_info":
+            out = get_country_info(tool_input["country"])
+        elif name == "define_word":
+            out = define_word(tool_input["word"])
+        elif name == "get_nest_devices":
+            out = get_nest_devices()
+        elif name == "get_thermostat_status":
+            out = get_thermostat_status()
+        elif name == "set_thermostat_temperature":
+            out = set_thermostat_temperature(tool_input["temperature"], tool_input.get("unit", "celsius"))
+        elif name == "set_thermostat_mode":
+            out = set_thermostat_mode(tool_input["mode"])
+        elif name == "get_camera_status":
+            out = get_camera_status()
+        elif name == "get_camera_snapshot":
+            out = _capture_camera_snapshot(user_id, tool_input.get("camera_name", ""))
+        elif name == "get_doorbell_snapshot":
+            out = _capture_doorbell_snapshot(user_id)
+        elif name == "get_upcoming_events":
+            out = get_upcoming_events(tool_input.get("max_results", 10))
+        elif name == "search_calendar_events":
+            out = search_calendar_events(tool_input["query"], tool_input.get("max_results", 5))
+        elif name == "get_recent_emails":
+            out = get_recent_emails(tool_input.get("max_results", 5))
+        elif name == "search_emails":
+            out = search_emails(tool_input["query"], tool_input.get("max_results", 5))
+        else:
+            out = "Unknown tool"
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        log_event(
+            logger,
+            "tool_result",
+            trace_id=tool_trace_id,
+            user_id=user_id,
+            action=name,
+            latency_ms=latency_ms,
+            result="ok",
+        )
+        return out
+    except Exception as exc:
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        count, should_alert = record_failure("tool:%s" % name)
+        log_event(
+            logger,
+            "tool_result",
+            trace_id=tool_trace_id,
+            user_id=user_id,
+            action=name,
+            latency_ms=latency_ms,
+            result="error",
+            error=str(exc)[:300],
+            consecutive_failures=count,
+        )
+        if should_alert:
+            logger.error("Tool %s failing repeatedly (%s)", name, count)
+        raise
 
 
 def generate_short_model_response(instruction: str, text: str, model: str = DEFAULT_MODEL) -> str:
@@ -666,19 +808,43 @@ def generate_short_model_response(instruction: str, text: str, model: str = DEFA
     return response.text or "I could not generate a response."
 
 
+def hydrate_conversation_from_storage(user_id: int, limit: int = 20) -> list[types.Content]:
+    rows = load_recent_conversation(user_id, limit=limit)
+    history: list[types.Content] = []
+    for row in rows:
+        payload = row.get("content") or {}
+        text = payload.get("text", "")
+        if not text:
+            continue
+        role = row.get("role", "user")
+        history.append(types.Content(role=role, parts=[types.Part(text=text)]))
+    return history
+
+
 def generate_agent_response(user_id: int, user_text: str, force_web: bool = False) -> str:
+    trace_id = make_trace_id()
+    started_at = time.perf_counter()
+    log_event(
+        logger,
+        "generate_agent_response",
+        trace_id=trace_id,
+        user_id=user_id,
+        action="start",
+        result="start",
+    )
     prefs = get_user_preferences(user_id)
     model = prefs.selected_model if prefs.selected_model in MODEL_CHOICES else DEFAULT_MODEL
     if user_id not in conversations:
-        conversations[user_id] = []
+        conversations[user_id] = hydrate_conversation_from_storage(user_id)
 
     prompt = user_text
     if force_web:
         prompt = f"Use web search to answer this with current info: {user_text}"
 
-    conversations[user_id].append(
-        types.Content(role="user", parts=[types.Part(text=prompt)])
-    )
+    user_content = types.Content(role="user", parts=[types.Part(text=prompt)])
+    conversations[user_id].append(user_content)
+    append_conversation_message(user_id, "user", {"text": prompt})
+    trim_conversation(user_id, keep_last=40)
     history = list(conversations[user_id][-20:])
 
     system_prompt = (
@@ -700,7 +866,20 @@ def generate_agent_response(user_id: int, user_text: str, force_web: bool = Fals
         if not function_call_parts:
             reply = extract_text_from_parts(candidate.content.parts)
             conversations[user_id].append(candidate.content)
+            append_conversation_message(user_id, "model", {"text": reply})
+            trim_conversation(user_id, keep_last=40)
             snapshot_path = _snapshot_queue.pop(user_id, None)
+            latency_ms = int((time.perf_counter() - started_at) * 1000)
+            reset_failure("generate_agent_response")
+            log_event(
+                logger,
+                "generate_agent_response",
+                trace_id=trace_id,
+                user_id=user_id,
+                action="complete",
+                latency_ms=latency_ms,
+                result="ok",
+            )
             return style_reply(reply or "I could not generate a response.", prefs.response_style), snapshot_path
 
         history.append(candidate.content)
@@ -708,7 +887,7 @@ def generate_agent_response(user_id: int, user_text: str, force_web: bool = Fals
         for part in function_call_parts:
             fc = part.function_call
             try:
-                result = run_tool(fc.name, dict(fc.args), user_id=user_id)
+                result = run_tool(fc.name, dict(fc.args), user_id=user_id, trace_id=trace_id)
             except Exception as exc:
                 logger.exception("Tool execution failed: %s", fc.name)
                 result = f"Tool '{fc.name}' failed: {exc}"
@@ -1213,7 +1392,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @handler_guard
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    conversations[user_id] = []
+    if user_id not in conversations:
+        conversations[user_id] = hydrate_conversation_from_storage(user_id)
     get_user_preferences(user_id)
     await update.message.reply_text(
         "Hi! I'm Bob.\n"
@@ -1225,6 +1405,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     conversations[user_id] = []
+    clear_conversation(user_id)
     await update.message.reply_text("Conversation reset.")
 
 
@@ -1292,6 +1473,213 @@ async def style_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _next_daily_run_iso(hhmm: str) -> str:
+    try:
+        h, m = hhmm.split(":", 1)
+        hour = max(0, min(23, int(h)))
+        minute = max(0, min(59, int(m)))
+    except Exception:
+        hour, minute = 8, 0
+    now = datetime.now(timezone.utc)
+    nxt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if nxt <= now:
+        nxt += timedelta(days=1)
+    return nxt.isoformat()
+
+
+@handler_guard
+async def brief_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    args = [a.strip().lower() for a in (context.args or [])]
+    if not PROACTIVE_MORNING_BRIEF_ENABLED:
+        await update.message.reply_text("Morning brief is disabled by configuration.")
+        return
+
+    if not args:
+        job = get_proactive_job(user_id, "morning_brief")
+        settings = get_proactive_settings(user_id)
+        enabled = bool(job and int(job.get("enabled", 0)))
+        await update.message.reply_text(
+            f"Morning brief is {'enabled' if enabled else 'disabled'}.\n"
+            f"Time: {settings.get('morning_brief_time', '08:00')}\n"
+            "Use `/brief on`, `/brief off`, or `/brief time HH:MM`."
+        )
+        return
+
+    if args[0] == "on":
+        settings = get_proactive_settings(user_id)
+        next_run = _next_daily_run_iso(settings.get("morning_brief_time", "08:00"))
+        upsert_proactive_job(
+            user_id=user_id,
+            job_type="morning_brief",
+            schedule_kind="daily_time",
+            schedule_json={"time": settings.get("morning_brief_time", "08:00")},
+            next_run_at=next_run,
+            enabled=True,
+        )
+        upsert_proactive_setting(user_id, "enabled", 1)
+        await update.message.reply_text("Morning brief enabled.")
+        return
+    if args[0] == "off":
+        set_proactive_job_enabled(user_id, "morning_brief", False)
+        await update.message.reply_text("Morning brief disabled.")
+        return
+    if args[0] == "time" and len(args) >= 2:
+        hhmm = args[1]
+        upsert_proactive_setting(user_id, "morning_brief_time", hhmm)
+        next_run = _next_daily_run_iso(hhmm)
+        upsert_proactive_job(
+            user_id=user_id,
+            job_type="morning_brief",
+            schedule_kind="daily_time",
+            schedule_json={"time": hhmm},
+            next_run_at=next_run,
+            enabled=True,
+        )
+        await update.message.reply_text(f"Morning brief time set to {hhmm}.")
+        return
+
+    await update.message.reply_text("Usage: `/brief on`, `/brief off`, `/brief time HH:MM`")
+
+
+@handler_guard
+async def quiet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    args = context.args or []
+    if not args:
+        settings = get_proactive_settings(user_id)
+        await update.message.reply_text(
+            f"Quiet hours: {settings.get('quiet_hours_start') or '(none)'}-{settings.get('quiet_hours_end') or '(none)'}\n"
+            "Use `/quiet HH:MM-HH:MM` or `/quiet off`."
+        )
+        return
+    raw = args[0].strip().lower()
+    if raw == "off":
+        upsert_proactive_setting(user_id, "quiet_hours_start", "")
+        upsert_proactive_setting(user_id, "quiet_hours_end", "")
+        await update.message.reply_text("Quiet hours cleared.")
+        return
+    if "-" not in raw:
+        await update.message.reply_text("Usage: `/quiet HH:MM-HH:MM`")
+        return
+    start, end = raw.split("-", 1)
+    upsert_proactive_setting(user_id, "quiet_hours_start", start)
+    upsert_proactive_setting(user_id, "quiet_hours_end", end)
+    await update.message.reply_text(f"Quiet hours set: {start}-{end}")
+
+
+@handler_guard
+async def proactive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    args = [a.strip().lower() for a in (context.args or [])]
+    if args[:2] in (["digest", "instant"], ["digest", "batched"]):
+        mode = args[1]
+        upsert_proactive_setting(user_id, "digest_mode", mode)
+        await update.message.reply_text(f"Digest mode set to `{mode}`.")
+        return
+    if args[:2] == ["nudges", "on"]:
+        if not PROACTIVE_CALENDAR_NUDGES_ENABLED:
+            await update.message.reply_text("Calendar nudges are disabled by configuration.")
+            return
+        next_run = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        upsert_proactive_job(
+            user_id=user_id,
+            job_type="calendar_nudge",
+            schedule_kind="interval_minutes",
+            schedule_json={"interval_minutes": 30},
+            next_run_at=next_run,
+            enabled=True,
+        )
+        await update.message.reply_text("Calendar nudges enabled.")
+        return
+    if args[:2] == ["nudges", "off"]:
+        set_proactive_job_enabled(user_id, "calendar_nudge", False)
+        await update.message.reply_text("Calendar nudges disabled.")
+        return
+    if args and args[0] in {"on", "off"}:
+        upsert_proactive_setting(user_id, "enabled", 1 if args[0] == "on" else 0)
+        await update.message.reply_text(f"Proactive mode {'enabled' if args[0] == 'on' else 'disabled'}.")
+        return
+
+    settings = get_proactive_settings(user_id)
+    brief = get_proactive_job(user_id, "morning_brief")
+    watcher_rows = list_watchers(user_id)
+    await update.message.reply_text(
+        "Proactive status:\n"
+        f"- Enabled: {bool(int(settings.get('enabled', 1)))}\n"
+        f"- Brief time: {settings.get('morning_brief_time', '08:00')}\n"
+        f"- Quiet hours: {settings.get('quiet_hours_start') or '(none)'}-{settings.get('quiet_hours_end') or '(none)'}\n"
+        f"- Digest mode: {settings.get('digest_mode', 'instant')}\n"
+        f"- Brief job: {'enabled' if brief and int(brief.get('enabled', 0)) else 'disabled'}\n"
+        f"- Watchers: {len(watcher_rows)}\n"
+        "Commands: `/proactive on|off`, `/proactive nudges on|off`, `/proactive digest instant|batched`"
+    )
+
+
+@handler_guard
+async def watchers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    args = context.args or []
+    if not PROACTIVE_WATCHERS_ENABLED:
+        await update.message.reply_text("Watchers are disabled by configuration.")
+        return
+
+    if not args or args[0].lower() == "list":
+        rows = list_watchers(user_id)
+        if not rows:
+            await update.message.reply_text("No watchers configured.")
+            return
+        lines = ["Watchers:"]
+        for w in rows:
+            lines.append(
+                f"- #{w['id']} [{w['watcher_type']}] {w['query']} "
+                f"({'on' if int(w['enabled']) else 'off'})"
+            )
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    action = args[0].lower()
+    if action == "add" and len(args) >= 3:
+        watcher_type = args[1].lower()
+        if watcher_type == "news":
+            query = " ".join(args[2:])
+            wid = upsert_watcher(user_id, "news_keyword", query, {"check_every_minutes": 60}, check_every_minutes=60)
+            await update.message.reply_text(f"Added news watcher #{wid} for: {query}")
+            return
+        if watcher_type == "price" and len(args) >= 5:
+            symbol = args[2].upper()
+            direction = args[3].lower()
+            threshold = float(args[4])
+            params = {"direction": direction, "threshold": threshold, "check_every_minutes": 30}
+            wid = upsert_watcher(user_id, "price_threshold", symbol, params, check_every_minutes=30)
+            await update.message.reply_text(
+                f"Added price watcher #{wid}: {symbol} {direction} {threshold}"
+            )
+            return
+        await update.message.reply_text("Usage: `/watchers add news <keywords>` or `/watchers add price <SYMBOL> <above|below> <VALUE>`")
+        return
+
+    if action in {"remove", "pause", "resume"} and len(args) >= 2 and args[1].isdigit():
+        wid = int(args[1])
+        if action == "remove":
+            delete_watcher(user_id, wid)
+            await update.message.reply_text(f"Removed watcher #{wid}.")
+            return
+        set_watcher_enabled(user_id, wid, action == "resume")
+        await update.message.reply_text(f"Watcher #{wid} {'resumed' if action == 'resume' else 'paused'}.")
+        return
+
+    await update.message.reply_text(
+        "Usage:\n"
+        "- `/watchers list`\n"
+        "- `/watchers add news <keywords>`\n"
+        "- `/watchers add price <SYMBOL> <above|below> <VALUE>`\n"
+        "- `/watchers pause <id>`\n"
+        "- `/watchers resume <id>`\n"
+        "- `/watchers remove <id>`"
+    )
+
+
 @handler_guard
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = (update.message.text or "").strip()
@@ -1306,6 +1694,10 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- /style\n"
         "- /model\n"
         "- /reset\n\n"
+        "- /brief\n"
+        "- /quiet\n"
+        "- /watchers\n"
+        "- /proactive\n\n"
         "Or tell me what you're trying to accomplish in plain language and I can guide you."
     )
 
@@ -1340,37 +1732,61 @@ def format_all_tools_text() -> str:
 
 
 async def on_post_stop(app):
-    if not OFFLINE_BROADCAST_ENABLED:
-        return
-    user_ids = list_known_user_ids()
-    if not user_ids:
-        return
-    logger.info("Broadcasting offline notice to %s user(s)", len(user_ids))
-    for user_id in user_ids:
-        try:
-            await app.bot.send_message(
-                chat_id=user_id,
-                text="Bob is currently offline. I will be back soon.",
-            )
-        except Exception:
-            logger.debug("Failed to send offline notice", extra={"user_id": user_id}, exc_info=True)
+    try:
+        global proactive_scheduler
+        if proactive_scheduler:
+            await proactive_scheduler.stop()
+        if OFFLINE_BROADCAST_ENABLED:
+            user_ids = list_known_user_ids()
+            if user_ids:
+                logger.info("Broadcasting offline notice to %s user(s)", len(user_ids))
+                for user_id in user_ids:
+                    try:
+                        await app.bot.send_message(
+                            chat_id=user_id,
+                            text="Bob is currently offline. I will be back soon.",
+                        )
+                    except Exception:
+                        logger.debug("Failed to send offline notice", extra={"user_id": user_id}, exc_info=True)
+    except Exception as exc:
+        log_event(logger, "startup_shutdown_error", action="post_stop", result="error", error=str(exc)[:300])
+        await dispatch_alert(
+            logger,
+            "Bob alert: post_stop hook failed.",
+            bot=app.bot,
+            admin_chat_id=ADMIN_CHAT_ID,
+            slack_webhook_url=ALERT_WEBHOOK_URL,
+        )
+        raise
 
 
 async def on_post_init(app):
-    if not ONLINE_BROADCAST_ENABLED:
-        return
-    user_ids = list_known_user_ids()
-    if not user_ids:
-        return
-    logger.info("Broadcasting online notice to %s user(s)", len(user_ids))
-    for user_id in user_ids:
-        try:
-            await app.bot.send_message(
-                chat_id=user_id,
-                text="I am back online.",
-            )
-        except Exception:
-            logger.debug("Failed to send online notice", extra={"user_id": user_id}, exc_info=True)
+    try:
+        global proactive_scheduler
+        proactive_scheduler = ProactiveScheduler(app)
+        proactive_scheduler.start()
+        if ONLINE_BROADCAST_ENABLED:
+            user_ids = list_known_user_ids()
+            if user_ids:
+                logger.info("Broadcasting online notice to %s user(s)", len(user_ids))
+                for user_id in user_ids:
+                    try:
+                        await app.bot.send_message(
+                            chat_id=user_id,
+                            text="I am back online.",
+                        )
+                    except Exception:
+                        logger.debug("Failed to send online notice", extra={"user_id": user_id}, exc_info=True)
+    except Exception as exc:
+        log_event(logger, "startup_shutdown_error", action="post_init", result="error", error=str(exc)[:300])
+        await dispatch_alert(
+            logger,
+            "Bob alert: post_init hook failed.",
+            bot=app.bot,
+            admin_chat_id=ADMIN_CHAT_ID,
+            slack_webhook_url=ALERT_WEBHOOK_URL,
+        )
+        raise
 
 
 def main():
@@ -1392,6 +1808,10 @@ def main():
     app.add_handler(CommandHandler("style", style_command))
     app.add_handler(CommandHandler("model", model_command))
     app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("brief", brief_command))
+    app.add_handler(CommandHandler("quiet", quiet_command))
+    app.add_handler(CommandHandler("watchers", watchers_command))
+    app.add_handler(CommandHandler("proactive", proactive_command))
 
     # Keep this after known CommandHandlers so it only catches unknown commands.
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
@@ -1402,7 +1822,23 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot started. Polling...")
-    app.run_polling()
+    try:
+        app.run_polling()
+    except Exception as exc:
+        log_event(logger, "startup_shutdown_error", action="run_polling", result="error", error=str(exc)[:300])
+        try:
+            asyncio.run(
+                dispatch_alert(
+                    logger,
+                    "Bob alert: bot polling loop crashed.",
+                    bot=app.bot,
+                    admin_chat_id=ADMIN_CHAT_ID,
+                    slack_webhook_url=ALERT_WEBHOOK_URL,
+                )
+            )
+        except Exception:
+            logger.debug("Failed to send crash alert", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":
