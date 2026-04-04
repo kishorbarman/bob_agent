@@ -116,7 +116,8 @@ SYSTEM_PROMPT = (
     "You are a helpful personal assistant called Bob. Be concise and direct. "
     "Use tools whenever they will give a better answer than your training data alone. "
     "If the user asks to see a camera view, call the camera snapshot tool instead of apologizing. "
-    "If the user asks to turn the thermostat off or change HVAC mode, call thermostat mode tools."
+    "If the user asks to turn the thermostat off or change HVAC mode, call thermostat mode tools. "
+    "Default to Fahrenheit when reporting temperatures unless the user explicitly asks for Celsius or another unit."
 )
 
 
@@ -161,6 +162,14 @@ async def processing_indicator(
         if status_message:
             with suppress(Exception):
                 await bot.delete_message(chat_id=chat_id, message_id=status_message.message_id)
+
+
+async def run_thread(func, *args, timeout_s: float = 60.0, **kwargs):
+    if kwargs:
+        call = lambda: func(*args, **kwargs)
+    else:
+        call = lambda: func(*args)
+    return await asyncio.wait_for(asyncio.to_thread(call), timeout=timeout_s)
 
 
 def gemini_generate_with_retry(model: str, contents, config, retries: int = 3):
@@ -417,6 +426,26 @@ def handler_guard(func):
                 result="ok",
             )
             return result
+        except asyncio.TimeoutError:
+            latency_ms = int((time.perf_counter() - started_at) * 1000)
+            log_event(
+                logger,
+                "handler_timeout",
+                trace_id=trace_id,
+                handler=func.__name__,
+                user_id=user_id,
+                latency_ms=latency_ms,
+                result="timeout",
+            )
+            if update.callback_query:
+                await update.callback_query.answer("That took too long. Please try again.")
+                await update.callback_query.message.reply_text(
+                    "That request timed out while I was working. Please try again."
+                )
+            elif update.message:
+                await update.message.reply_text(
+                    "That request timed out while I was working. Please try again."
+                )
         except Exception as exc:
             logger.exception("Handler failed", extra={"handler": func.__name__})
             latency_ms = int((time.perf_counter() - started_at) * 1000)
@@ -991,29 +1020,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_status = pending_status_map.get(pending_tool, "Bob is working on it...")
         async with processing_indicator(context.bot, chat_id, status_text=pending_status):
             if pending_tool == "tool_weather":
-                raw = await asyncio.to_thread(fetch_weather, text)
+                raw = await run_thread(fetch_weather, text)
                 out = render_card("weather", raw) if UX_PHASE2_ENABLED else raw
             elif pending_tool == "tool_news":
-                raw = await asyncio.to_thread(get_news, text, 5)
+                raw = await run_thread(get_news, text, 5)
                 out = render_card("news", raw) if UX_PHASE2_ENABLED else raw
             elif pending_tool == "tool_web_search":
-                out = await asyncio.to_thread(search_web, text, 5)
+                out = await run_thread(search_web, text, 5)
             elif pending_tool == "tool_wikipedia":
-                out = await asyncio.to_thread(wikipedia_search, text)
+                out = await run_thread(wikipedia_search, text)
             elif pending_tool == "tool_calculate":
-                out = await asyncio.to_thread(calculate, text)
+                out = await run_thread(calculate, text)
             elif pending_tool == "tool_country":
-                out = await asyncio.to_thread(get_country_info, text)
+                out = await run_thread(get_country_info, text)
             elif pending_tool == "tool_define":
-                out = await asyncio.to_thread(define_word, text)
+                out = await run_thread(define_word, text)
             elif pending_tool == "tool_calendar_search":
-                raw = await asyncio.to_thread(search_calendar_events, text, 5)
+                raw = await run_thread(search_calendar_events, text, 5)
                 out = render_card("calendar", raw) if UX_PHASE2_ENABLED else raw
             elif pending_tool == "tool_email_search":
-                raw = await asyncio.to_thread(search_emails, text, 5)
+                raw = await run_thread(search_emails, text, 5)
                 out = render_card("email", raw) if UX_PHASE2_ENABLED else raw
             elif pending_tool == "tool_camera_snapshot":
-                out = await asyncio.to_thread(run_tool, "get_camera_snapshot", {"camera_name": text}, user_id)
+                out = await run_thread(run_tool, "get_camera_snapshot", {"camera_name": text}, user_id)
             else:
                 out = "Unsupported tool input."
         snapshot_path = _snapshot_queue.pop(user_id, None)
@@ -1040,7 +1069,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No recent file context found.")
             return
         async with processing_indicator(context.bot, chat_id, status_text="Bob is reading your file..."):
-            answer = await asyncio.to_thread(
+            answer = await run_thread(
                 generate_short_model_response,
                 f"Answer the user question using only this artifact context:\n\n{artifact['content_text']}",
                 f"Question: {text}",
@@ -1051,12 +1080,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thermostat_mode = detect_thermostat_mode_request(text)
     if thermostat_mode:
         async with processing_indicator(context.bot, chat_id, status_text="Bob is updating the thermostat..."):
-            out = await asyncio.to_thread(run_tool, "set_thermostat_mode", {"mode": thermostat_mode}, user_id)
+            out = await run_thread(run_tool, "set_thermostat_mode", {"mode": thermostat_mode}, user_id)
         await send_reply_with_actions(update, text, out)
         return
 
     async with processing_indicator(context.bot, chat_id, status_text="Bob is thinking..."):
-        reply, snapshot_path = await asyncio.to_thread(generate_agent_response, user_id, text)
+        reply, snapshot_path = await run_thread(generate_agent_response, user_id, text)
 
     if snapshot_path:
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
@@ -1101,7 +1130,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await tg_file.download_to_drive(custom_path=str(temp_path))
         async with processing_indicator(context.bot, update.effective_chat.id, status_text="Bob is analyzing the image..."):
             user_model = get_user_preferences(update.effective_user.id).selected_model
-            summary = await asyncio.to_thread(analyze_image, temp_path, user_model)
+            summary = await run_thread(analyze_image, temp_path, user_model)
     finally:
         if temp_path.exists():
             temp_path.unlink()
@@ -1136,18 +1165,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with processing_indicator(context.bot, update.effective_chat.id, status_text="Bob is reading the document..."):
             user_model = get_user_preferences(update.effective_user.id).selected_model
             if doc_type == "image":
-                content = await asyncio.to_thread(analyze_image, temp_path, user_model)
+                content = await run_thread(analyze_image, temp_path, user_model)
                 artifact_type = "image"
             elif doc_type == "pdf":
-                extracted = await asyncio.to_thread(extract_pdf_text, temp_path)
+                extracted = await run_thread(extract_pdf_text, temp_path)
                 if not extracted.strip():
                     await update.message.reply_text("I could not extract text from that PDF.")
                     return
-                content = await asyncio.to_thread(summarize_document_text, extracted, user_model)
+                content = await run_thread(summarize_document_text, extracted, user_model)
                 artifact_type = "document"
             else:
-                extracted = await asyncio.to_thread(temp_path.read_text, errors="ignore")
-                content = await asyncio.to_thread(summarize_document_text, extracted, user_model)
+                extracted = await run_thread(temp_path.read_text, errors="ignore")
+                content = await run_thread(summarize_document_text, extracted, user_model)
                 artifact_type = "document"
     finally:
         if temp_path.exists():
@@ -1280,7 +1309,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if action == "tool_calendar":
         async with processing_indicator(context.bot, query.message.chat_id, status_text="Bob is checking your calendar..."):
-            text = await asyncio.to_thread(get_upcoming_events, 8)
+            text = await run_thread(get_upcoming_events, 8)
         await query.message.reply_text(render_card("calendar", text) if UX_PHASE2_ENABLED else text)
         return
     if action == "tool_calendar_search":
@@ -1289,7 +1318,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if action == "tool_email":
         async with processing_indicator(context.bot, query.message.chat_id, status_text="Bob is checking your inbox..."):
-            text = await asyncio.to_thread(get_recent_emails, 5)
+            text = await run_thread(get_recent_emails, 5)
         await query.message.reply_text(render_card("email", text) if UX_PHASE2_ENABLED else text)
         return
     if action == "tool_email_search":
@@ -1298,17 +1327,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if action == "tool_nest_devices":
         async with processing_indicator(context.bot, query.message.chat_id, status_text="Bob is checking your Nest devices..."):
-            text = await asyncio.to_thread(get_nest_devices)
+            text = await run_thread(get_nest_devices)
         await query.message.reply_text(text)
         return
     if action == "tool_nest":
         async with processing_indicator(context.bot, query.message.chat_id, status_text="Bob is checking the thermostat..."):
-            text = await asyncio.to_thread(get_thermostat_status)
+            text = await run_thread(get_thermostat_status)
         await query.message.reply_text(text)
         return
     if action == "tool_camera_status":
         async with processing_indicator(context.bot, query.message.chat_id, status_text="Bob is checking camera status..."):
-            text = await asyncio.to_thread(get_camera_status)
+            text = await run_thread(get_camera_status)
         await query.message.reply_text(text)
         return
     if action == "tool_camera_snapshot":
@@ -1317,7 +1346,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if action == "tool_doorbell_snapshot":
         async with processing_indicator(context.bot, query.message.chat_id, status_text="Bob is checking the doorbell camera..."):
-            text = await asyncio.to_thread(run_tool, "get_doorbell_snapshot", {}, user_id)
+            text = await run_thread(run_tool, "get_doorbell_snapshot", {}, user_id)
         snapshot_path = _snapshot_queue.pop(user_id, None)
         if snapshot_path:
             await query.message.reply_photo(photo=open(snapshot_path, "rb"), caption=text)
@@ -1347,7 +1376,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("No pending transcription found.")
             return
         async with processing_indicator(context.bot, query.message.chat_id, status_text="Bob is thinking..."):
-            reply, snapshot_path = await asyncio.to_thread(generate_agent_response, user_id, text)
+            reply, snapshot_path = await run_thread(generate_agent_response, user_id, text)
         if snapshot_path:
             await query.message.reply_photo(photo=open(snapshot_path, "rb"), caption=reply)
             os.unlink(snapshot_path)
@@ -1367,7 +1396,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if action == "artifact_summarize":
             async with processing_indicator(context.bot, query.message.chat_id, status_text="Bob is summarizing your file..."):
                 model = get_user_preferences(user_id).selected_model
-                out = await asyncio.to_thread(
+                out = await run_thread(
                     generate_short_model_response,
                     "Summarize this artifact in 5 concise bullets.",
                     artifact["content_text"],
@@ -1377,7 +1406,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         async with processing_indicator(context.bot, query.message.chat_id, status_text="Bob is extracting action items..."):
             model = get_user_preferences(user_id).selected_model
-            out = await asyncio.to_thread(
+            out = await run_thread(
                 generate_short_model_response,
                 "Extract actionable next steps from this artifact.",
                 artifact["content_text"],
