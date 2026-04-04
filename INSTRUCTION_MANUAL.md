@@ -58,6 +58,7 @@ GEMINI_API_KEY=...
 
 ```env
 NEST_PROJECT_ID=...
+TELEGRAM_ALLOWLIST_USER_IDS=123456789
 ADMIN_CHAT_ID=...
 ALERT_WEBHOOK_URL=...
 UX_PHASE2_ENABLED=true
@@ -354,7 +355,7 @@ docker logs -f bob-agent
 
 - Keep `.env`, `credentials.json`, `token.json` out of git
 - Restrict who can access the bot token
-- Add Telegram user allowlist if multiple people can message the bot
+- Enforce Telegram allowlist with `TELEGRAM_ALLOWLIST_USER_IDS` (comma-separated Telegram numeric user IDs)
 - Add explicit confirmation for destructive actions (future write-capable tools)
 
 ## 16) Extending Bob

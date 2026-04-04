@@ -54,6 +54,7 @@ Edit `.env`:
 ```
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 GEMINI_API_KEY=your_gemini_api_key
+TELEGRAM_ALLOWLIST_USER_IDS=your_telegram_user_id
 ```
 
 ### 3. Google Calendar & Gmail (optional)

@@ -98,6 +98,19 @@ logger = logging.getLogger(__name__)
 ADMIN_CHAT_ID_RAW = os.getenv("ADMIN_CHAT_ID", "").strip()
 ADMIN_CHAT_ID = int(ADMIN_CHAT_ID_RAW) if ADMIN_CHAT_ID_RAW.isdigit() else None
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").strip()
+TELEGRAM_ALLOWLIST_USER_IDS_RAW = os.getenv("TELEGRAM_ALLOWLIST_USER_IDS", "").strip()
+
+
+def _parse_user_allowlist(raw: str) -> set[int]:
+    ids: set[int] = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if token.isdigit():
+            ids.add(int(token))
+    return ids
+
+
+ALLOWED_TELEGRAM_USER_IDS = _parse_user_allowlist(TELEGRAM_ALLOWLIST_USER_IDS_RAW)
 
 gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 DEFAULT_MODEL = "models/gemini-3.1-flash-lite-preview"
@@ -405,6 +418,23 @@ def handler_guard(func):
         trace_id = make_trace_id()
         started_at = time.perf_counter()
         user_id = update.effective_user.id if update and update.effective_user else None
+        if user_id is not None and ALLOWED_TELEGRAM_USER_IDS and user_id not in ALLOWED_TELEGRAM_USER_IDS:
+            log_event(
+                logger,
+                "unauthorized_user",
+                trace_id=trace_id,
+                handler=func.__name__,
+                user_id=user_id,
+                result="blocked",
+            )
+            if update.callback_query:
+                await update.callback_query.answer("You are not authorized to use this bot.")
+                await update.callback_query.message.reply_text(
+                    "You are not authorized to use this bot."
+                )
+            elif update.message:
+                await update.message.reply_text("You are not authorized to use this bot.")
+            return
         log_event(
             logger,
             "handler_start",
